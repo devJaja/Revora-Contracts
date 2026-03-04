@@ -147,6 +147,10 @@ const EVENT_MIN_REV_THRESHOLD_SET: Symbol = symbol_short!("min_rev");
 const EVENT_REV_BELOW_THRESHOLD: Symbol = symbol_short!("rev_below");
 /// Emitted when an offering's supply cap is reached (#96).
 const EVENT_SUPPLY_CAP_REACHED: Symbol = symbol_short!("cap_reach");
+/// Emitted when per-offering investment constraints are set or updated (#97).
+const EVENT_INV_CONSTRAINTS: Symbol = symbol_short!("inv_cfg");
+/// Emitted when per-offering or platform per-asset fee is set (#98).
+const EVENT_FEE_CONFIG: Symbol = symbol_short!("fee_cfg");
 
 const BPS_DENOMINATOR: i128 = 10_000;
 
@@ -179,6 +183,14 @@ pub struct ConcentrationLimitConfig {
     pub max_bps: u32,
     /// If true, `report_revenue` will fail if current concentration exceeds `max_bps`.
     pub enforce: bool,
+}
+
+/// Per-offering investment constraints (#97). Min/max stake per investor; off-chain enforced.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct InvestmentConstraintsConfig {
+    pub min_stake: i128,
+    pub max_stake: i128,
 }
 
 /// Per-offering audit log summary (#34).
@@ -307,6 +319,10 @@ pub enum DataKey {
     OfferingMetadata(Address, Address),
     /// Platform fee in basis points (max 5000 = 50%) taken from reported revenue (#6).
     PlatformFeeBps,
+    /// Per-offering per-asset fee override (#98). (issuer, token, asset) -> fee_bps.
+    OfferingFeeBps(Address, Address, Address),
+    /// Platform-level per-asset fee (#98). asset -> fee_bps; overrides global PlatformFeeBps when set.
+    PlatformFeePerAsset(Address),
 
     /// Per (issuer, token): minimum revenue per period below which no distribution is triggered (#25).
     MinRevenueThreshold(Address, Address),
@@ -320,6 +336,8 @@ pub enum DataKey {
     DepositedRevenue(Address),
     /// Per-offering supply cap (#96). 0 = no cap.
     SupplyCap(Address, Address),
+    /// Per-offering investment constraints: min and max stake per investor (#97).
+    InvestmentConstraints(Address, Address),
 }
 
 /// Maximum number of offerings returned in a single page.
@@ -1342,6 +1360,51 @@ impl RevoraRevenueShare {
     /// Get per-offering audit summary (total revenue and report count).
     pub fn get_audit_summary(env: Env, issuer: Address, token: Address) -> Option<AuditSummary> {
         let key = DataKey::AuditSummary(issuer, token);
+        env.storage().persistent().get(&key)
+    }
+
+    // ── Per-offering investment constraints (#97) ─────────────
+
+    /// Set min and max stake per investor for an offering. Issuer/admin only. Constraints are read by off-chain systems for enforcement.
+    pub fn set_investment_constraints(
+        env: Env,
+        issuer: Address,
+        token: Address,
+        min_stake: i128,
+        max_stake: i128,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        let current_issuer =
+            Self::get_current_issuer(&env, &token).ok_or(RevoraError::OfferingNotFound)?;
+        if current_issuer != issuer {
+            return Err(RevoraError::OfferingNotFound);
+        }
+        issuer.require_auth();
+        if min_stake < 0 || max_stake < 0 {
+            return Err(RevoraError::InvalidAmount);
+        }
+        if max_stake > 0 && min_stake > max_stake {
+            return Err(RevoraError::InvalidAmount);
+        }
+        let key = DataKey::InvestmentConstraints(issuer.clone(), token.clone());
+        let previous = env.storage().persistent().get::<DataKey, InvestmentConstraintsConfig>(&key);
+        env.storage()
+            .persistent()
+            .set(&key, &InvestmentConstraintsConfig { min_stake, max_stake });
+        env.events().publish(
+            (EVENT_INV_CONSTRAINTS, issuer, token),
+            (min_stake, max_stake, previous.is_some()),
+        );
+        Ok(())
+    }
+
+    /// Get per-offering investment constraints. Returns None if not set.
+    pub fn get_investment_constraints(
+        env: Env,
+        issuer: Address,
+        token: Address,
+    ) -> Option<InvestmentConstraintsConfig> {
+        let key = DataKey::InvestmentConstraints(issuer, token);
         env.storage().persistent().get(&key)
     }
 
@@ -2607,12 +2670,85 @@ impl RevoraRevenueShare {
         (amount * fee_bps).checked_div(BPS_DENOMINATOR).unwrap_or(0)
     }
 
+    // ── Multi-currency fee config (#98) ───────────────────────
+
+    /// Set per-offering per-asset fee in bps. Issuer only. Max 5000 (50%).
+    pub fn set_offering_fee_bps(
+        env: Env,
+        issuer: Address,
+        token: Address,
+        asset: Address,
+        fee_bps: u32,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        let current_issuer =
+            Self::get_current_issuer(&env, &token).ok_or(RevoraError::OfferingNotFound)?;
+        if current_issuer != issuer {
+            return Err(RevoraError::OfferingNotFound);
+        }
+        issuer.require_auth();
+        if fee_bps > MAX_PLATFORM_FEE_BPS {
+            return Err(RevoraError::LimitReached);
+        }
+        let key = DataKey::OfferingFeeBps(issuer.clone(), token.clone(), asset.clone());
+        env.storage().persistent().set(&key, &fee_bps);
+        env.events().publish((EVENT_FEE_CONFIG, issuer, token), (asset, fee_bps, true));
+        Ok(())
+    }
+
+    /// Set platform-level per-asset fee in bps. Admin only. Overrides global platform fee for this asset.
+    pub fn set_platform_fee_per_asset(env: Env, admin: Address, asset: Address, fee_bps: u32) -> Result<(), RevoraError> {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().persistent().get(&DataKey::Admin).ok_or(RevoraError::LimitReached)?;
+        if admin != stored_admin {
+            return Err(RevoraError::NotAuthorized);
+        }
+        if fee_bps > MAX_PLATFORM_FEE_BPS {
+            return Err(RevoraError::LimitReached);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::PlatformFeePerAsset(asset.clone()), &fee_bps);
+        env.events().publish((EVENT_FEE_CONFIG, admin, asset), (fee_bps, false));
+        Ok(())
+    }
+
+    /// Effective fee bps for (offering, asset). Precedence: offering fee > platform per-asset > global platform fee.
+    pub fn get_effective_fee_bps(env: Env, issuer: Address, token: Address, asset: Address) -> u32 {
+        let offering_key = DataKey::OfferingFeeBps(issuer.clone(), token.clone(), asset.clone());
+        if let Some(bps) = env.storage().persistent().get::<DataKey, u32>(&offering_key) {
+            return bps;
+        }
+        let platform_asset_key = DataKey::PlatformFeePerAsset(asset);
+        if let Some(bps) = env.storage().persistent().get::<DataKey, u32>(&platform_asset_key) {
+            return bps;
+        }
+        env.storage().persistent().get(&DataKey::PlatformFeeBps).unwrap_or(0)
+    }
+
+    /// Calculate fee for (offering, asset, amount) using effective fee bps.
+    pub fn calculate_fee_for_asset(
+        env: Env,
+        issuer: Address,
+        token: Address,
+        asset: Address,
+        amount: i128,
+    ) -> i128 {
+        let fee_bps = Self::get_effective_fee_bps(env, issuer, token, asset) as i128;
+        (amount * fee_bps).checked_div(BPS_DENOMINATOR).unwrap_or(0)
+    }
+
     /// Return the current contract version (#23). Used for upgrade compatibility and migration.
     pub fn get_version(env: Env) -> u32 {
         let _ = env;
         CONTRACT_VERSION
     }
 }
+
+pub mod vesting;
+
+#[cfg(test)]
+mod vesting_test;
 
 mod test;
 mod test_auth;
