@@ -1,14 +1,10 @@
 #![cfg(test)]
 
-use soroban_sdk::{testutils::{Address as _, Events}, Address, Env};
-use crate::{RevoraRevenueShare, RevoraRevenueShareClient};
-use crate::{RevoraError, RevoraRevenueShare, RevoraRevenueShareClient, RoundingMode};
 use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Events as _, Ledger as _},
     token, vec, Address, Env, IntoVal, String as SdkString, Symbol, Vec,
 };
-
 use crate::{
     ProposalAction, RevoraError, RevoraRevenueShare, RevoraRevenueShareClient, RoundingMode,
 };
@@ -1553,12 +1549,12 @@ fn get_whitelist_empty_before_any_add() {
     let env = Env::default();
     env.mock_all_auths();
     let client = make_client(&env);
-    let token  = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    let payout_asset = Address::generate(&env);
+    client.register_offering(&issuer, &token, &1_000, &payout_asset);
 
     for period_id in 1..=100_u64 {
-
-        client.report_revenue(&issuer, &token, &(period_id as i128 * 10_000), &period_id, &false);
-
         client.report_revenue(
             &issuer,
             &token,
@@ -1567,7 +1563,6 @@ fn get_whitelist_empty_before_any_add() {
             &period_id,
             &false,
         );
-
     }
     assert!(env.events().all().len() >= 100);
     assert_eq!(client.get_whitelist(&token).len(), 0);
@@ -1864,6 +1859,8 @@ fn whitelist_enabled_when_non_empty() {
     
     client.whitelist_remove(&admin, &token, &investor);
     assert!(!client.is_whitelist_enabled(&token));
+}
+
 // ── structured error codes (#41) ──────────────────────────────
 
 #[test]
@@ -1910,8 +1907,11 @@ fn single_report_is_persisted() {
     let issuer = Address::generate(&env);
     let token = Address::generate(&env);
 
-    client.report_revenue(&issuer, &token, &5_000, &1, &false);
-    assert_eq!(client.get_revenue_by_period(&token, &1), 5_000);
+    client.report_revenue(&issuer, &token, &token, &5_000, &1, &false);
+    assert_eq!(client.get_revenue_by_period(&token, 1), 5_000);
+}
+
+#[test]
 fn storage_stress_many_offerings_no_panic() {
     let (env, client, issuer) = setup();
     register_n(&env, &client, &issuer, STORAGE_STRESS_OFFERING_COUNT);
@@ -1931,8 +1931,8 @@ fn multiple_reports_same_period_accumulate() {
     let issuer = Address::generate(&env);
     let token = Address::generate(&env);
 
-    client.report_revenue(&issuer, &token, &3_000, &7, &false);
-    client.report_revenue(&issuer, &token, &2_000, &7, &true); // Use true for override to test accumulation if intended, but wait...
+    client.report_revenue(&issuer, &token, &token, &3_000, &7, &false);
+    client.report_revenue(&issuer, &token, &token, &2_000, &7, &true); // Use true for override to test accumulation if intended, but wait...
                                                                // Actually, report_revenue in lib.rs now OVERWRITES if override_existing is true.
                                                                // beda819 wanted accumulation.
                                                                // If I want accumulation, I should change lib.rs to accumulate even on override?
@@ -1947,8 +1947,8 @@ fn multiple_reports_same_period_accumulate() {
     // If I want to support beda819's "accumulation", I should perhaps NOT use override_existing for accumulation.
     // But the tests in beda819 were:
     /*
-    client.report_revenue(&issuer, &token, &3_000, &7);
-    client.report_revenue(&issuer, &token, &2_000, &7);
+    client.report_revenue(&issuer, &token, &token, &3_000, &7, &false);
+    client.report_revenue(&issuer, &token, &token, &2_000, &7, &false);
     assert_eq!(client.get_revenue_by_period(&token, &7), 5_000);
     */
     // This implies that multiple reports for the same period SHOULD accumulate.
@@ -1986,11 +1986,10 @@ fn multiple_reports_same_period_accumulate_is_disabled() {
     let issuer = Address::generate(&env);
     let token = Address::generate(&env);
 
-    client.report_revenue(&issuer, &token, &3_000, &7, &false);
+    client.report_revenue(&issuer, &token, &token, &3_000, &7, &false);
     // Second report without override should fail or just emit REJECTED event depending on implementation.
-    // In my lib.rs it emits REJECTED and returns Ok(()).
-    client.report_revenue(&issuer, &token, &2_000, &7, &false);
-    assert_eq!(client.get_revenue_by_period(&token, &7), 3_000);
+    client.report_revenue(&issuer, &token, &token, &2_000, &7, &false);
+    assert_eq!(client.get_revenue_by_period(&token, 7), 3_000);
 }
 
 #[test]
@@ -2005,6 +2004,19 @@ fn empty_period_returns_zero() {
 
 #[test]
 fn get_revenue_range_sums_periods() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    let payout_asset = Address::generate(&env);
+    client.register_offering(&issuer, &token, &1000, &payout_asset);
+    client.report_revenue(&issuer, &token, &payout_asset, &100, &1, &false);
+    client.report_revenue(&issuer, &token, &payout_asset, &200, &2, &false);
+    assert_eq!(client.get_revenue_range(&token, 1, 2), 300);
+}
+
+#[test]
 fn gas_characterization_many_offerings_single_issuer() {
     let (env, client, issuer) = setup();
     let n = 50_u32;
@@ -2044,7 +2056,7 @@ fn revenue_matches_event_amount() {
     let token = Address::generate(&env);
     let amount: i128 = 42_000;
 
-    client.report_revenue(&issuer, &token, &amount, &5, &false);
+    client.report_revenue(&issuer, &token, &token, &amount, &5, &false);
 
     assert_eq!(client.get_revenue_by_period(&token, &5), amount);
     assert!(!env.events().all().is_empty());
@@ -2058,7 +2070,7 @@ fn large_period_range_sums_correctly() {
     let issuer = Address::generate(&env);
     let token = Address::generate(&env);
     client.register_offering(&issuer, &token, &1_000);
-    client.report_revenue(&issuer, &token, &1_000, &1, &false);
+    client.report_revenue(&issuer, &token, &token, &1_000, &1, &false);
 }
 
 // ---------------------------------------------------------------------------
@@ -3561,7 +3573,7 @@ fn set_snapshot_config_requires_auth() {
     // No mock_all_auths
     let result = client.try_set_snapshot_config(&issuer, &token, &true);
     assert!(result.is_err());
-
+}
 
 // ===========================================================================
 // Testnet mode tests (#24)
@@ -4078,6 +4090,9 @@ fn issuer_transfer_blocked_when_frozen() {
 
     client.set_admin(&admin);
     client.freeze();
+    let result = client.try_propose_issuer_transfer(&token, &new_issuer);
+    assert!(result.is_err());
+}
 
 // ===========================================================================
 // Multisig admin pattern tests
@@ -4761,7 +4776,7 @@ fn pause_unpause_idempotence_and_events() {
     let client = make_client(&env);
     let admin = Address::generate(&env);
 
-    client.initialize(&admin, &None::<Address>);
+    client.initialize(&admin, &None::<Address>, &None::<bool>);
     assert!(!client.is_paused());
 
     // Pause twice (idempotent)
@@ -4791,7 +4806,7 @@ fn register_blocked_while_paused() {
     let token = Address::generate(&env);
     let payout_asset = Address::generate(&env);
 
-    client.initialize(&admin, &None::<Address>);
+    client.initialize(&admin, &None::<Address>, &None::<bool>);
     client.pause_admin(&admin);
     client.register_offering(&issuer, &token, &1_000, &payout_asset);
 }
@@ -4807,7 +4822,7 @@ fn report_blocked_while_paused() {
     let token = Address::generate(&env);
     let payout_asset = Address::generate(&env);
 
-    client.initialize(&admin, &None::<Address>);
+    client.initialize(&admin, &None::<Address>, &None::<bool>);
     // Register before pausing
     client.register_offering(&issuer, &token, &1_000, &payout_asset);
     client.pause_admin(&admin);
@@ -4822,7 +4837,7 @@ fn pause_safety_role_works() {
     let admin = Address::generate(&env);
     let safety = Address::generate(&env);
 
-    client.initialize(&admin, &Some(safety.clone()));
+    client.initialize(&admin, &Some(safety.clone()), &None::<bool>);
     assert!(!client.is_paused());
 
     // Safety can pause
@@ -4844,7 +4859,7 @@ fn blacklist_add_blocked_while_paused() {
     let token = Address::generate(&env);
     let investor = Address::generate(&env);
 
-    client.initialize(&admin, &None::<Address>);
+    client.initialize(&admin, &None::<Address>, &None::<bool>);
     client.pause_admin(&admin);
     client.blacklist_add(&admin, &token, &investor);
 }
@@ -4859,13 +4874,25 @@ fn blacklist_remove_blocked_while_paused() {
     let token = Address::generate(&env);
     let investor = Address::generate(&env);
 
-    client.initialize(&admin, &None::<Address>);
+    client.initialize(&admin, &None::<Address>, &None::<bool>);
     client.pause_admin(&admin);
     client.blacklist_remove(&admin, &token, &investor);
  
 }
 #[test]
 fn large_period_range_sums_correctly_full() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let issuer = Address::generate(&env);
+    let token = Address::generate(&env);
+    let payout_asset = Address::generate(&env);
+    client.register_offering(&issuer, &token, &1000, &payout_asset);
+    for period in 1..=10 {
+        client.report_revenue(&issuer, &token, &payout_asset, &(period * 100), &period, &false);
+    }
+    assert_eq!(client.get_revenue_range(&token, 1, 10), 100 + 200 + 300 + 400 + 500 + 600 + 700 + 800 + 900 + 1000);
+}
 
 // ===========================================================================
 // On-chain revenue distribution calculation (#4)
@@ -5391,6 +5418,7 @@ fn test_event_only_mode_testnet_config() {
     assert!(events.iter().any(|e| e.1.contains(symbol_short!("test_mode"))));
 
     assert!(!client.is_testnet_mode());
+}
 
 // ── Per-offering metadata storage tests (#8) ──────────────────
 
@@ -5495,7 +5523,7 @@ fn test_set_metadata_respects_freeze() {
     let issuer = Address::generate(&env);
     let token = Address::generate(&env);
 
-    client.initialize(&admin, &None);
+    client.initialize(&admin, &None, &None::<bool>);
     client.register_offering(&issuer, &token, &1000, &token);
     client.freeze();
 
@@ -5514,7 +5542,7 @@ fn test_set_metadata_respects_pause() {
     let issuer = Address::generate(&env);
     let token = Address::generate(&env);
 
-    client.initialize(&admin, &None);
+    client.initialize(&admin, &None, &None::<bool>);
     client.register_offering(&issuer, &token, &1000, &token);
     client.pause_admin(&admin);
 
@@ -5948,7 +5976,7 @@ fn default_platform_fee_is_zero() {
     let contract_id = env.register_contract(None, RevoraRevenueShare);
     let client = RevoraRevenueShareClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
-    client.initialize(&admin, &None::<Address>);
+    client.initialize(&admin, &None::<Address>, &None::<bool>);
     assert_eq!(client.get_platform_fee(), 0);
 }
 
@@ -5959,7 +5987,7 @@ fn set_and_get_platform_fee() {
     let contract_id = env.register_contract(None, RevoraRevenueShare);
     let client = RevoraRevenueShareClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
-    client.initialize(&admin, &None::<Address>);
+    client.initialize(&admin, &None::<Address>, &None::<bool>);
     client.set_platform_fee(&250);
     assert_eq!(client.get_platform_fee(), 250);
 }
@@ -5971,7 +5999,7 @@ fn set_platform_fee_to_zero() {
     let contract_id = env.register_contract(None, RevoraRevenueShare);
     let client = RevoraRevenueShareClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
-    client.initialize(&admin, &None::<Address>);
+    client.initialize(&admin, &None::<Address>, &None::<bool>);
     client.set_platform_fee(&500);
     client.set_platform_fee(&0);
     assert_eq!(client.get_platform_fee(), 0);
@@ -5984,7 +6012,7 @@ fn set_platform_fee_to_maximum() {
     let contract_id = env.register_contract(None, RevoraRevenueShare);
     let client = RevoraRevenueShareClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
-    client.initialize(&admin, &None::<Address>);
+    client.initialize(&admin, &None::<Address>, &None::<bool>);
     client.set_platform_fee(&5000);
     assert_eq!(client.get_platform_fee(), 5000);
 }
@@ -5996,7 +6024,7 @@ fn set_platform_fee_above_maximum_fails() {
     let contract_id = env.register_contract(None, RevoraRevenueShare);
     let client = RevoraRevenueShareClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
-    client.initialize(&admin, &None::<Address>);
+    client.initialize(&admin, &None::<Address>, &None::<bool>);
     let result = client.try_set_platform_fee(&5001);
     assert!(result.is_err());
 }
@@ -6008,7 +6036,7 @@ fn update_platform_fee_multiple_times() {
     let contract_id = env.register_contract(None, RevoraRevenueShare);
     let client = RevoraRevenueShareClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
-    client.initialize(&admin, &None::<Address>);
+    client.initialize(&admin, &None::<Address>, &None::<bool>);
     client.set_platform_fee(&100);
     assert_eq!(client.get_platform_fee(), 100);
     client.set_platform_fee(&200);
@@ -6024,7 +6052,7 @@ fn set_platform_fee_requires_admin() {
     let contract_id = env.register_contract(None, RevoraRevenueShare);
     let client = RevoraRevenueShareClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
-    client.initialize(&admin, &None::<Address>);
+    client.initialize(&admin, &None::<Address>, &None::<bool>);
     client.set_platform_fee(&100);
 }
 
@@ -6035,7 +6063,7 @@ fn calculate_platform_fee_basic() {
     let contract_id = env.register_contract(None, RevoraRevenueShare);
     let client = RevoraRevenueShareClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
-    client.initialize(&admin, &None::<Address>);
+    client.initialize(&admin, &None::<Address>, &None::<bool>);
     client.set_platform_fee(&250); // 2.5%
     let fee = client.calculate_platform_fee(&10_000);
     assert_eq!(fee, 250); // 10000 * 250 / 10000 = 250
@@ -6048,7 +6076,7 @@ fn calculate_platform_fee_with_zero_amount() {
     let contract_id = env.register_contract(None, RevoraRevenueShare);
     let client = RevoraRevenueShareClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
-    client.initialize(&admin, &None::<Address>);
+    client.initialize(&admin, &None::<Address>, &None::<bool>);
     client.set_platform_fee(&500);
     let fee = client.calculate_platform_fee(&0);
     assert_eq!(fee, 0);
@@ -6061,7 +6089,7 @@ fn calculate_platform_fee_with_zero_fee() {
     let contract_id = env.register_contract(None, RevoraRevenueShare);
     let client = RevoraRevenueShareClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
-    client.initialize(&admin, &None::<Address>);
+    client.initialize(&admin, &None::<Address>, &None::<bool>);
     let fee = client.calculate_platform_fee(&10_000);
     assert_eq!(fee, 0);
 }
@@ -6073,7 +6101,7 @@ fn calculate_platform_fee_at_maximum_rate() {
     let contract_id = env.register_contract(None, RevoraRevenueShare);
     let client = RevoraRevenueShareClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
-    client.initialize(&admin, &None::<Address>);
+    client.initialize(&admin, &None::<Address>, &None::<bool>);
     client.set_platform_fee(&5000); // 50%
     let fee = client.calculate_platform_fee(&10_000);
     assert_eq!(fee, 5_000);
@@ -6086,7 +6114,7 @@ fn calculate_platform_fee_precision() {
     let contract_id = env.register_contract(None, RevoraRevenueShare);
     let client = RevoraRevenueShareClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
-    client.initialize(&admin, &None::<Address>);
+    client.initialize(&admin, &None::<Address>, &None::<bool>);
     client.set_platform_fee(&1); // 0.01%
     let fee = client.calculate_platform_fee(&1_000_000);
     assert_eq!(fee, 100); // 1000000 * 1 / 10000 = 100
@@ -6099,7 +6127,7 @@ fn platform_fee_only_admin_can_set() {
     let contract_id = env.register_contract(None, RevoraRevenueShare);
     let client = RevoraRevenueShareClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
-    client.initialize(&admin, &None::<Address>);
+    client.initialize(&admin, &None::<Address>, &None::<bool>);
     client.set_platform_fee(&100);
 }
 
@@ -6110,7 +6138,7 @@ fn platform_fee_large_amount() {
     let contract_id = env.register_contract(None, RevoraRevenueShare);
     let client = RevoraRevenueShareClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
-    client.initialize(&admin, &None::<Address>);
+    client.initialize(&admin, &None::<Address>, &None::<bool>);
     client.set_platform_fee(&100); // 1%
     let large_amount: i128 = 1_000_000_000_000;
     let fee = client.calculate_platform_fee(&large_amount);
@@ -6124,7 +6152,7 @@ fn platform_fee_integration_with_revenue() {
     let contract_id = env.register_contract(None, RevoraRevenueShare);
     let client = RevoraRevenueShareClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
-    client.initialize(&admin, &None::<Address>);
+    client.initialize(&admin, &None::<Address>, &None::<bool>);
     client.set_platform_fee(&500); // 5%
     let revenue: i128 = 100_000;
     let fee = client.calculate_platform_fee(&revenue);
@@ -6813,3 +6841,4 @@ fn aggregation_stress_many_offerings() {
     assert_eq!(metrics.total_reported_revenue, 2_100_000);
     assert_eq!(metrics.total_report_count, 20);
 }
+} // mod regression

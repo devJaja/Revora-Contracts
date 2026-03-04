@@ -11,7 +11,7 @@ fn make_client(env: &Env) -> RevoraRevenueShareClient<'_> {
 fn init_admin_safety(env: &Env, client: &RevoraRevenueShareClient) -> (Address, Address) {
     let admin = Address::generate(env);
     let safety = Address::generate(env);
-    client.initialize(&admin, &Some(safety.clone()));
+    client.initialize(&admin, &Some(safety.clone()), &None::<bool>);
     (admin, safety)
 }
 
