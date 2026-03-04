@@ -143,6 +143,8 @@ const EVENT_METADATA_UPDATED: Symbol = symbol_short!("meta_upd");
 const EVENT_MIN_REV_THRESHOLD_SET: Symbol = symbol_short!("min_rev");
 /// Emitted when reported revenue is below the offering's minimum threshold; no distribution triggered (#25).
 const EVENT_REV_BELOW_THRESHOLD: Symbol = symbol_short!("rev_below");
+/// Emitted when per-offering or platform per-asset fee is set (#98).
+const EVENT_FEE_CONFIG: Symbol = symbol_short!("fee_cfg");
 
 const BPS_DENOMINATOR: i128 = 10_000;
 
@@ -303,6 +305,10 @@ pub enum DataKey {
     OfferingMetadata(Address, Address),
     /// Platform fee in basis points (max 5000 = 50%) taken from reported revenue (#6).
     PlatformFeeBps,
+    /// Per-offering per-asset fee override (#98). (issuer, token, asset) -> fee_bps.
+    OfferingFeeBps(Address, Address, Address),
+    /// Platform-level per-asset fee (#98). asset -> fee_bps; overrides global PlatformFeeBps when set.
+    PlatformFeePerAsset(Address),
 
     /// Per (issuer, token): minimum revenue per period below which no distribution is triggered (#25).
     MinRevenueThreshold(Address, Address),
@@ -2557,6 +2563,74 @@ impl RevoraRevenueShare {
     /// Calculate the platform fee for a given amount.
     pub fn calculate_platform_fee(env: Env, amount: i128) -> i128 {
         let fee_bps = Self::get_platform_fee(env) as i128;
+        (amount * fee_bps).checked_div(BPS_DENOMINATOR).unwrap_or(0)
+    }
+
+    // ── Multi-currency fee config (#98) ───────────────────────
+
+    /// Set per-offering per-asset fee in bps. Issuer only. Max 5000 (50%).
+    pub fn set_offering_fee_bps(
+        env: Env,
+        issuer: Address,
+        token: Address,
+        asset: Address,
+        fee_bps: u32,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        let current_issuer =
+            Self::get_current_issuer(&env, &token).ok_or(RevoraError::OfferingNotFound)?;
+        if current_issuer != issuer {
+            return Err(RevoraError::OfferingNotFound);
+        }
+        issuer.require_auth();
+        if fee_bps > MAX_PLATFORM_FEE_BPS {
+            return Err(RevoraError::LimitReached);
+        }
+        let key = DataKey::OfferingFeeBps(issuer.clone(), token.clone(), asset.clone());
+        env.storage().persistent().set(&key, &fee_bps);
+        env.events().publish((EVENT_FEE_CONFIG, issuer, token), (asset, fee_bps, true));
+        Ok(())
+    }
+
+    /// Set platform-level per-asset fee in bps. Admin only. Overrides global platform fee for this asset.
+    pub fn set_platform_fee_per_asset(env: Env, admin: Address, asset: Address, fee_bps: u32) -> Result<(), RevoraError> {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().persistent().get(&DataKey::Admin).ok_or(RevoraError::LimitReached)?;
+        if admin != stored_admin {
+            return Err(RevoraError::NotAuthorized);
+        }
+        if fee_bps > MAX_PLATFORM_FEE_BPS {
+            return Err(RevoraError::LimitReached);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::PlatformFeePerAsset(asset.clone()), &fee_bps);
+        env.events().publish((EVENT_FEE_CONFIG, admin, asset), (fee_bps, false));
+        Ok(())
+    }
+
+    /// Effective fee bps for (offering, asset). Precedence: offering fee > platform per-asset > global platform fee.
+    pub fn get_effective_fee_bps(env: Env, issuer: Address, token: Address, asset: Address) -> u32 {
+        let offering_key = DataKey::OfferingFeeBps(issuer.clone(), token.clone(), asset.clone());
+        if let Some(bps) = env.storage().persistent().get::<DataKey, u32>(&offering_key) {
+            return bps;
+        }
+        let platform_asset_key = DataKey::PlatformFeePerAsset(asset);
+        if let Some(bps) = env.storage().persistent().get::<DataKey, u32>(&platform_asset_key) {
+            return bps;
+        }
+        env.storage().persistent().get(&DataKey::PlatformFeeBps).unwrap_or(0)
+    }
+
+    /// Calculate fee for (offering, asset, amount) using effective fee bps.
+    pub fn calculate_fee_for_asset(
+        env: Env,
+        issuer: Address,
+        token: Address,
+        asset: Address,
+        amount: i128,
+    ) -> i128 {
+        let fee_bps = Self::get_effective_fee_bps(env, issuer, token, asset) as i128;
         (amount * fee_bps).checked_div(BPS_DENOMINATOR).unwrap_or(0)
     }
 
