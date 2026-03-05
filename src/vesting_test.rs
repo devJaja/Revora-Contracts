@@ -60,7 +60,7 @@ fn get_claimable_before_cliff_is_zero() {
     let start = 1000_u64;
     let cliff = 500_u64;
     let duration = 2000_u64;
-    client.create_schedule(&admin, &beneficiary, &token_id, &total, &start, &cliff, &duration).unwrap();
+    client.create_schedule(&admin, &beneficiary, &token_id, &total, &start, &cliff, &duration);
 
     env.ledger().with_mut(|l| l.timestamp = start + 100);
     let claimable = client.get_claimable(&admin, &0);
@@ -73,7 +73,7 @@ fn cancel_schedule() {
     env.mock_all_auths();
     let (client, admin, beneficiary, token_id) = setup(&env);
     let _ = client.initialize(&admin);
-    client.create_schedule(&admin, &beneficiary, &token_id, &1_000_000, &1000, &100, &2000).unwrap();
+    client.create_schedule(&admin, &beneficiary, &token_id, &1_000_000, &1000, &100, &2000);
 
     let _ = client.cancel_schedule(&admin, &beneficiary, &0);
     let schedule = client.get_schedule(&admin, &0);
@@ -87,8 +87,8 @@ fn multiple_schedules_same_beneficiary() {
     let (client, admin, beneficiary, token_id) = setup(&env);
     let _ = client.initialize(&admin);
 
-    client.create_schedule(&admin, &beneficiary, &token_id, &100, &1000, &0, &1000).unwrap();
-    client.create_schedule(&admin, &beneficiary, &token_id, &200, &2000, &0, &1000).unwrap();
+    client.create_schedule(&admin, &beneficiary, &token_id, &100, &1000, &0, &1000);
+    client.create_schedule(&admin, &beneficiary, &token_id, &200, &2000, &0, &1000);
     assert_eq!(client.get_schedule_count(&admin), 2);
 }
 

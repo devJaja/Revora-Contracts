@@ -1,5 +1,5 @@
 #![cfg(test)]
-use soroban_sdk::{testutils::Address as _, Address, Env, String as SdkString, Vec};
+use soroban_sdk::{symbol_short, testutils::Address as _, Address, Env, String as SdkString, Vec};
 
 use crate::{RevoraRevenueShare, RevoraRevenueShareClient, RoundingMode};
 
@@ -19,7 +19,7 @@ fn setup_offering(env: &Env, client: &RevoraRevenueShareClient) -> (Address, Add
     env.mock_all_auths();
     let issuer = Address::generate(env);
     let token = Address::generate(env);
-    client.register_offering(&issuer, &token, &1_000, &token);
+    client.register_offering(&issuer, &symbol_short!("def"), &token, &1_000, &token);
     (issuer, token)
 }
 
@@ -130,9 +130,9 @@ fn register_offering_missing_auth_no_mutation() {
     let issuer = Address::generate(&env);
     let token = Address::generate(&env);
     assert!(client
-        .try_register_offering(&issuer, &token, &1_000, &token)
+        .try_register_offering(&issuer, &symbol_short!("def"), &token, &1_000, &token)
         .is_err());
-    assert_eq!(client.get_offering_count(&issuer), 0);
+    assert_eq!(client.get_offering_count(&issuer, &symbol_short!("def")), 0);
 }
 
 #[test]
@@ -247,7 +247,7 @@ fn blacklist_add_wrong_caller_no_mutation() {
     assert!(client
         .try_blacklist_add(&attacker, &token, &investor)
         .is_err());
-    assert!(!client.is_blacklisted(&token, &investor));
+    assert!(!client.is_blacklisted(&&issuer, &symbol_short!("def"), token, &investor));
     let bl: Vec<Address> = client.get_blacklist(&token);
     assert_eq!(bl.len(), 0);
 }
@@ -260,13 +260,13 @@ fn blacklist_remove_wrong_caller_no_mutation() {
     let issuer = Address::generate(&env);
     let token = Address::generate(&env);
     let investor = Address::generate(&env);
-    client.register_offering(&issuer, &token, &1_000, &token);
-    client.blacklist_add(&issuer, &token, &investor);
+    client.register_offering(&issuer, &symbol_short!("def"), &token, &1_000, &token);
+    client.blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &investor);
     let attacker = Address::generate(&env);
     assert!(client
         .try_blacklist_remove(&attacker, &token, &investor)
         .is_err());
-    assert!(client.is_blacklisted(&token, &investor));
+    assert!(client.is_blacklisted(&&issuer, &symbol_short!("def"), token, &investor));
 }
 
 #[test]
@@ -279,8 +279,8 @@ fn cross_offering_confusion_wrong_issuer_no_mutation() {
     let token_a = Address::generate(&env);
     let token_b = Address::generate(&env);
     let holder = Address::generate(&env);
-    client.register_offering(&issuer_a, &token_a, &1_000, &token_a);
-    client.register_offering(&issuer_b, &token_b, &1_000, &token_b);
+    client.register_offering(&issuer_a, &symbol_short!("def"), &token_a, &1_000, &token_a);
+    client.register_offering(&issuer_b, &symbol_short!("def"), &token_b, &1_000, &token_b);
     assert!(client
         .try_set_holder_share(&issuer_b, &token_a, &holder, &1_000u32)
         .is_err());
