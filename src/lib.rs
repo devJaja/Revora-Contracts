@@ -6,7 +6,7 @@ use soroban_sdk::{
     BytesN, Env, Map, String, Symbol, Vec,
 };
 
-// Issue #104 — Granular feature flags (experimental contract features).
+// Issue #106 — Per-offering pause (complement global emergency pause).
 // Placeholder branch for upstream PR scaffolding; full implementation in follow-up.
 
 /// Centralized contract error codes. Auth failures are signaled by host panic (require_auth).
