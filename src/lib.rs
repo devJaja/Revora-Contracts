@@ -6,7 +6,7 @@ use soroban_sdk::{
     BytesN, Env, Map, String, Symbol, Vec,
 };
 
-// Issue #107 — Soft-delete / archival semantics for old offerings.
+// Issue #109 — Revenue report correction workflow with audit trail.
 // Placeholder branch for upstream PR scaffolding; full implementation in follow-up.
 
 /// Centralized contract error codes. Auth failures are signaled by host panic (require_auth).
