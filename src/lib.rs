@@ -883,109 +883,128 @@ impl RevoraRevenueShare {
     /// In testnet mode, bps validation is skipped to allow flexible testing.
     ///
     /// Register a new offering. `supply_cap`: max cumulative deposited revenue for this offering; 0 = no cap (#96).
-    pub fn register_offering(
-        env: Env,
-        issuer: Address,
-        namespace: Symbol,
-        token: Address,
-        revenue_share_bps: u32,
-        payout_asset: Address,
-        supply_cap: i128,
-    ) -> Result<(), RevoraError> {
-        Self::require_not_frozen(&env)?;
-        Self::require_not_paused(&env);
-        issuer.require_auth();
+  pub fn register_offering(
+    env: Env,
+    issuer: Address,
+    namespace: Symbol,
+    token: Address,
+    revenue_share_bps: u32,
+    payout_asset: Address,
+    supply_cap: i128,
+) -> Result<(), RevoraError> {
+    Self::require_not_frozen(&env)?;
+    Self::require_not_paused(&env);
+    issuer.require_auth();
 
-        // Skip bps validation in testnet mode
-        let testnet_mode = Self::is_testnet_mode(env.clone());
-        if !testnet_mode && revenue_share_bps > 10_000 {
-            return Err(RevoraError::InvalidRevenueShareBps);
-        }
-
-        if !Self::is_event_only(&env) {
-            // Track issuer in global registry for cross-offering aggregation (#39)
-            let registered_key = DataKey::IssuerRegistered(issuer.clone());
-            if !env.storage().persistent().has(&registered_key) {
-                let issuer_count_key = DataKey::IssuerCount;
-                let issuer_count: u32 =
-                    env.storage().persistent().get(&issuer_count_key).unwrap_or(0);
-                let issuer_item_key = DataKey::IssuerItem(issuer_count);
-                env.storage().persistent().set(&issuer_item_key, &issuer.clone());
-                env.storage().persistent().set(&issuer_count_key, &(issuer_count + 1));
-                env.storage().persistent().set(&registered_key, &true);
-            }
-
-            // Register namespace for issuer if not already present
-            let ns_reg_key = DataKey::NamespaceRegistered(issuer.clone(), namespace.clone());
-            if !env.storage().persistent().has(&ns_reg_key) {
-                let ns_count_key = DataKey::NamespaceCount(issuer.clone());
-                let count: u32 = env.storage().persistent().get(&ns_count_key).unwrap_or(0);
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::NamespaceItem(issuer.clone(), count), &namespace);
-                env.storage().persistent().set(&ns_count_key, &(count + 1));
-                env.storage().persistent().set(&ns_reg_key, &true);
-            }
-
-            let tenant_id = TenantId { issuer: issuer.clone(), namespace: namespace.clone() };
-            let count_key = DataKey::OfferCount(tenant_id.clone());
-            let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
-
-            let offering = Offering {
-                issuer: issuer.clone(),
-                namespace: namespace.clone(),
-                token: token.clone(),
-                revenue_share_bps,
-                payout_asset: payout_asset.clone(),
-            };
-
-            let item_key = DataKey::OfferItem(tenant_id.clone(), count);
-            env.storage().persistent().set(&item_key, &offering);
-            env.storage().persistent().set(&count_key, &(count + 1));
-
-            // Maintain reverse lookup: id -> current_issuer
-            let offering_id = OfferingId {
-                issuer: issuer.clone(),
-                namespace: namespace.clone(),
-                token: token.clone(),
-            };
-            let issuer_lookup_key = DataKey::OfferingIssuer(offering_id.clone());
-            env.storage().persistent().set(&issuer_lookup_key, &issuer);
-
-            if supply_cap > 0 {
-                let cap_key = DataKey::SupplyCap(offering_id);
-                env.storage().persistent().set(&cap_key, &supply_cap);
-            }
-        }
-
-        env.events().publish(
-            (symbol_short!("offer_reg"), issuer.clone(), namespace.clone()),
-            (token.clone(), revenue_share_bps, payout_asset.clone()),
-        );
-        env.events().publish(
-            (
-                EVENT_INDEXED_V2,
-                EventIndexTopicV2 {
-                    version: 2,
-                    event_type: EVENT_TYPE_OFFER,
-                    issuer: issuer.clone(),
-                    namespace: namespace.clone(),
-                    token: token.clone(),
-                    period_id: 0,
-                },
-            ),
-            (revenue_share_bps, payout_asset.clone()),
-        );
-
-        // Optionally emit a versioned v1 event with explicit version field
-        if Self::is_event_versioning_enabled(env.clone()) {
-            env.events().publish(
-                (EVENT_OFFER_REG_V1, issuer.clone(), namespace.clone()),
-                (EVENT_SCHEMA_VERSION, token.clone(), revenue_share_bps, payout_asset.clone()),
-            );
-        }
-        Ok(())
+    let testnet_mode = Self::is_testnet_mode(env.clone());
+    if !testnet_mode && revenue_share_bps > 10_000 {
+        return Err(RevoraError::InvalidRevenueShareBps);
     }
+
+    if !Self::is_event_only(&env) {
+        // Duplicate prevention with idempotent behavior:
+        // if the offering already exists for the same issuer/namespace/token,
+        // do not insert duplicate storage again.
+        if Self::get_offering(
+            env.clone(),
+            issuer.clone(),
+            namespace.clone(),
+            token.clone(),
+        )
+        .is_some()
+        {
+            return Ok(());
+        }
+
+        // Track issuer in global registry for cross-offering aggregation (#39)
+        let registered_key = DataKey::IssuerRegistered(issuer.clone());
+        if !env.storage().persistent().has(&registered_key) {
+            let issuer_count_key = DataKey::IssuerCount;
+            let issuer_count: u32 = env.storage().persistent().get(&issuer_count_key).unwrap_or(0);
+            let issuer_item_key = DataKey::IssuerItem(issuer_count);
+            env.storage().persistent().set(&issuer_item_key, &issuer.clone());
+            env.storage().persistent().set(&issuer_count_key, &(issuer_count + 1));
+            env.storage().persistent().set(&registered_key, &true);
+        }
+
+        // Register namespace for issuer if not already present
+        let ns_reg_key = DataKey::NamespaceRegistered(issuer.clone(), namespace.clone());
+        if !env.storage().persistent().has(&ns_reg_key) {
+            let ns_count_key = DataKey::NamespaceCount(issuer.clone());
+            let count: u32 = env.storage().persistent().get(&ns_count_key).unwrap_or(0);
+            env.storage()
+                .persistent()
+                .set(&DataKey::NamespaceItem(issuer.clone(), count), &namespace);
+            env.storage().persistent().set(&ns_count_key, &(count + 1));
+            env.storage().persistent().set(&ns_reg_key, &true);
+        }
+
+        let tenant_id = TenantId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+        };
+        let count_key = DataKey::OfferCount(tenant_id.clone());
+        let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+
+        let offering = Offering {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+            revenue_share_bps,
+            payout_asset: payout_asset.clone(),
+        };
+
+        let item_key = DataKey::OfferItem(tenant_id.clone(), count);
+        env.storage().persistent().set(&item_key, &offering);
+        env.storage().persistent().set(&count_key, &(count + 1));
+
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+        let issuer_lookup_key = DataKey::OfferingIssuer(offering_id.clone());
+        env.storage().persistent().set(&issuer_lookup_key, &issuer);
+
+        if supply_cap > 0 {
+            let cap_key = DataKey::SupplyCap(offering_id);
+            env.storage().persistent().set(&cap_key, &supply_cap);
+        }
+    }
+
+    env.events().publish(
+        (symbol_short!("offer_reg"), issuer.clone(), namespace.clone()),
+        (token.clone(), revenue_share_bps, payout_asset.clone()),
+    );
+    env.events().publish(
+        (
+            EVENT_INDEXED_V2,
+            EventIndexTopicV2 {
+                version: 2,
+                event_type: EVENT_TYPE_OFFER,
+                issuer: issuer.clone(),
+                namespace: namespace.clone(),
+                token: token.clone(),
+                period_id: 0,
+            },
+        ),
+        (revenue_share_bps, payout_asset.clone()),
+    );
+
+    if Self::is_event_versioning_enabled(env.clone()) {
+        env.events().publish(
+            (EVENT_OFFER_REG_V1, issuer.clone(), namespace.clone()),
+            (
+                EVENT_SCHEMA_VERSION,
+                token.clone(),
+                revenue_share_bps,
+                payout_asset.clone(),
+            ),
+        );
+    }
+
+    Ok(())
+}
 
     /// Fetch a single offering by issuer and token.
     ///
