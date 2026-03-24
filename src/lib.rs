@@ -3475,7 +3475,11 @@ impl RevoraRevenueShare {
         namespace: Symbol,
         token: Address,
     ) -> Result<(), RevoraError> {
-        let offering_id = OfferingId { issuer, namespace, token };
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
         let pending_key = DataKey::PendingIssuerTransfer(offering_id.clone());
         let pending: PendingTransfer =
             env.storage().persistent().get(&pending_key).ok_or(RevoraError::NoTransferPending)?;
