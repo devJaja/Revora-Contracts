@@ -8083,5 +8083,370 @@ mod scenarios {
         assert!(claim_res_blocked.is_err(), "Claim should fail due to blacklist");
     }
 }
-} // mod regression
 
+
+// ===========================================================================
+// Claim Idempotency Guarantees
+// ===========================================================================
+/// Tests for the idempotency and atomicity invariants of `claim()`.
+///
+/// Security assumptions verified here:
+/// - `LastClaimedIdx` is never advanced without a successful (or zero-amount) claim.
+/// - Repeated calls on exhausted state return `NoPendingClaims` with no side effects.
+/// - Blacklist, auth, and share checks fire before any state mutation.
+/// - Per-holder indices are fully isolated.
+/// - Zero-payout periods advance the index (no stuck state).
+/// - Delay-blocked calls leave state unchanged.
+#[cfg(test)]
+mod claim_idempotency {
+    use super::*;
+
+    // ── helpers ──────────────────────────────────────────────
+
+    fn setup() -> (Env, RevoraRevenueShareClient<'static>, Address, Address, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let cid = env.register_contract(None, RevoraRevenueShare);
+        let client = RevoraRevenueShareClient::new(&env, &cid);
+        let issuer = Address::generate(&env);
+        let token = Address::generate(&env);
+        let (pt, pt_admin) = create_payment_token(&env);
+        client.register_offering(&issuer, &symbol_short!("def"), &token, &10_000, &pt, &0);
+        mint_tokens(&env, &pt, &pt_admin, &issuer, &100_000_000);
+        (env, client, issuer, token, pt, cid)
+    }
+
+    fn dep(
+        client: &RevoraRevenueShareClient,
+        issuer: &Address,
+        token: &Address,
+        pt: &Address,
+        amount: i128,
+        period: u64,
+    ) {
+        client.deposit_revenue(issuer, &symbol_short!("def"), token, pt, &amount, &period);
+    }
+
+    fn share(client: &RevoraRevenueShareClient, issuer: &Address, token: &Address, holder: &Address, bps: u32) {
+        client.set_holder_share(issuer, &symbol_short!("def"), token, holder, &bps);
+    }
+
+    fn do_claim(client: &RevoraRevenueShareClient, holder: &Address, issuer: &Address, token: &Address, max: u32) -> bool {
+        // Returns true on success, false on any error.
+        client.try_claim(holder, issuer, &symbol_short!("def"), token, &max).is_ok()
+    }
+
+    // ── 1. Exhausted state is safe to retry ──────────────────
+
+    /// Calling claim() after all periods are consumed returns NoPendingClaims
+    /// without writing any state. Verifies the exhausted-state idempotency guarantee.
+    #[test]
+    fn exhausted_claim_returns_no_pending_claims_without_side_effects() {
+        let (env, client, issuer, token, pt, _cid) = setup();
+        let holder = Address::generate(&env);
+
+        share(&client, &issuer, &token, &holder, 10_000);
+        dep(&client, &issuer, &token, &pt, 50_000, 1);
+
+        // First claim succeeds
+        let payout = client.claim(&holder, &issuer, &symbol_short!("def"), &token, &0);
+        assert_eq!(payout, 50_000);
+
+        // All subsequent calls return NoPendingClaims
+        for _ in 0..3 {
+            assert!(!do_claim(&client, &holder, &issuer, &token, 0), "exhausted claim must return error");
+        }
+
+        // Balance unchanged after retries
+        assert_eq!(balance(&env, &pt, &holder), 50_000);
+    }
+
+    // ── 2. Index not advanced when delay blocks all periods ──
+
+    /// When ClaimDelaySecs blocks every period in the window, the function
+    /// returns ClaimDelayNotElapsed and LastClaimedIdx is not written.
+    #[test]
+    fn delay_blocked_claim_leaves_index_unchanged() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let cid = env.register_contract(None, RevoraRevenueShare);
+        let client = RevoraRevenueShareClient::new(&env, &cid);
+        let issuer = Address::generate(&env);
+        let token = Address::generate(&env);
+        let (pt, pt_admin) = create_payment_token(&env);
+
+        // Register with 1-day claim delay
+        client.register_offering(&issuer, &symbol_short!("def"), &token, &10_000, &pt, &86_400);
+        mint_tokens(&env, &pt, &pt_admin, &issuer, &1_000_000);
+
+        let holder = Address::generate(&env);
+        share(&client, &issuer, &token, &holder, 10_000);
+        dep(&client, &issuer, &token, &pt, 100_000, 1);
+
+        // Attempt claim immediately — delay not elapsed
+        assert!(!do_claim(&client, &holder, &issuer, &token, 0));
+
+        // Advance time past delay
+        env.ledger().with_mut(|li| li.timestamp = env.ledger().timestamp() + 86_401);
+
+        // Now claim succeeds — index was never corrupted by the failed attempt
+        let payout = client.claim(&holder, &issuer, &symbol_short!("def"), &token, &0);
+        assert_eq!(payout, 100_000);
+    }
+
+    // ── 3. Zero-payout periods advance index (no stuck state) ─
+
+    /// Periods where revenue * share_bps / 10_000 == 0 (truncation to zero)
+    /// must still advance LastClaimedIdx so the holder is never permanently stuck.
+    #[test]
+    fn zero_payout_period_advances_index_no_transfer() {
+        let (env, client, issuer, token, pt, cid) = setup();
+        let holder = Address::generate(&env);
+
+        // 1 bps share on 1 unit revenue → 0 payout (truncation)
+        share(&client, &issuer, &token, &holder, 1);
+        dep(&client, &issuer, &token, &pt, 1, 1);
+        dep(&client, &issuer, &token, &pt, 100_000, 2);
+
+        let contract_balance_before = balance(&env, &pt, &cid);
+
+        // Claim both periods; period 1 yields 0, period 2 yields 10 (1 bps of 100_000)
+        let payout = client.claim(&holder, &issuer, &symbol_short!("def"), &token, &0);
+        assert_eq!(payout, 10); // 0 + 10
+
+        // Index advanced past both periods — no more pending
+        assert!(!do_claim(&client, &holder, &issuer, &token, 0), "index must have advanced past zero-payout period");
+
+        // Contract balance decreased only by actual payout
+        assert_eq!(balance(&env, &pt, &cid), contract_balance_before - 10);
+    }
+
+    // ── 4. Per-holder index isolation ────────────────────────
+
+    /// One holder's claim progress must not affect another holder's index.
+    #[test]
+    fn holder_indices_are_fully_isolated() {
+        let (env, client, issuer, token, pt, _cid) = setup();
+        let holder_a = Address::generate(&env);
+        let holder_b = Address::generate(&env);
+
+        share(&client, &issuer, &token, &holder_a, 5_000);
+        share(&client, &issuer, &token, &holder_b, 3_000);
+
+        dep(&client, &issuer, &token, &pt, 100_000, 1);
+        dep(&client, &issuer, &token, &pt, 200_000, 2);
+        dep(&client, &issuer, &token, &pt, 300_000, 3);
+
+        // A claims all 3 periods
+        let payout_a = client.claim(&holder_a, &issuer, &symbol_short!("def"), &token, &0);
+        assert_eq!(payout_a, 300_000); // 50% of 600k
+
+        // B's index is untouched — still has all 3 periods
+        let pending_b = client.get_pending_periods(&issuer, &symbol_short!("def"), &token, &holder_b);
+        assert_eq!(pending_b.len(), 3);
+
+        let payout_b = client.claim(&holder_b, &issuer, &symbol_short!("def"), &token, &0);
+        assert_eq!(payout_b, 180_000); // 30% of 600k
+
+        assert_eq!(balance(&env, &pt, &holder_a), 300_000);
+        assert_eq!(balance(&env, &pt, &holder_b), 180_000);
+    }
+
+    // ── 5. Blacklist check fires before any state write ──────
+
+    /// A blacklisted holder must be rejected before any storage mutation.
+    /// After removal from blacklist, the holder can claim normally with
+    /// the index still at its original position.
+    #[test]
+    fn blacklisted_holder_rejected_before_state_mutation() {
+        let (env, client, issuer, token, pt, _cid) = setup();
+        let holder = Address::generate(&env);
+
+        share(&client, &issuer, &token, &holder, 10_000);
+        dep(&client, &issuer, &token, &pt, 100_000, 1);
+
+        // Blacklist before any claim
+        client.blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &holder);
+        assert!(!do_claim(&client, &holder, &issuer, &token, 0));
+
+        // Remove from blacklist — index must still be at 0
+        client.blacklist_remove(&issuer, &issuer, &symbol_short!("def"), &token, &holder);
+
+        let payout = client.claim(&holder, &issuer, &symbol_short!("def"), &token, &0);
+        assert_eq!(payout, 100_000, "full payout available after blacklist removal");
+    }
+
+    // ── 6. Zero-share holder rejected before state write ─────
+
+    /// A holder with share_bps == 0 must be rejected with NoPendingClaims
+    /// before any storage write.
+    #[test]
+    fn zero_share_holder_rejected_before_state_mutation() {
+        let (env, client, issuer, token, pt, _cid) = setup();
+        let holder = Address::generate(&env);
+
+        dep(&client, &issuer, &token, &pt, 100_000, 1);
+        // No share set for holder
+        assert!(!do_claim(&client, &holder, &issuer, &token, 0));
+
+        // Setting share after the failed attempt allows a successful claim
+        share(&client, &issuer, &token, &holder, 10_000);
+        let payout = client.claim(&holder, &issuer, &symbol_short!("def"), &token, &0);
+        assert_eq!(payout, 100_000);
+    }
+
+    // ── 7. Partial batch does not re-process earlier periods ─
+
+    /// When max_periods limits the batch, the next call starts exactly where
+    /// the previous one left off — no period is processed twice.
+    #[test]
+    fn partial_batch_no_reprocessing() {
+        let (env, client, issuer, token, pt, _cid) = setup();
+        let holder = Address::generate(&env);
+
+        share(&client, &issuer, &token, &holder, 10_000);
+        for i in 1..=6_u64 {
+            dep(&client, &issuer, &token, &pt, 10_000, i);
+        }
+
+        // Claim 2 at a time
+        let p1 = client.claim(&holder, &issuer, &symbol_short!("def"), &token, &2);
+        let p2 = client.claim(&holder, &issuer, &symbol_short!("def"), &token, &2);
+        let p3 = client.claim(&holder, &issuer, &symbol_short!("def"), &token, &2);
+
+        assert_eq!(p1, 20_000);
+        assert_eq!(p2, 20_000);
+        assert_eq!(p3, 20_000);
+
+        // Total equals sum of all 6 periods — no double-counting
+        assert_eq!(balance(&env, &pt, &holder), 60_000);
+
+        // Exhausted
+        assert!(!do_claim(&client, &holder, &issuer, &token, 0));
+    }
+
+    // ── 8. New periods after full claim are claimable ────────
+
+    /// After all existing periods are claimed, depositing new periods makes
+    /// them claimable from the current index position.
+    #[test]
+    fn new_periods_after_full_claim_are_claimable() {
+        let (env, client, issuer, token, pt, _cid) = setup();
+        let holder = Address::generate(&env);
+
+        share(&client, &issuer, &token, &holder, 10_000);
+        dep(&client, &issuer, &token, &pt, 50_000, 1);
+
+        let p1 = client.claim(&holder, &issuer, &symbol_short!("def"), &token, &0);
+        assert_eq!(p1, 50_000);
+
+        // Exhausted
+        assert!(!do_claim(&client, &holder, &issuer, &token, 0));
+
+        // New deposit
+        dep(&client, &issuer, &token, &pt, 80_000, 2);
+
+        let p2 = client.claim(&holder, &issuer, &symbol_short!("def"), &token, &0);
+        assert_eq!(p2, 80_000);
+
+        assert_eq!(balance(&env, &pt, &holder), 130_000);
+    }
+
+    // ── 9. max_periods=1 processes exactly one period ────────
+
+    /// max_periods=1 must process exactly one period per call, advancing
+    /// the index by exactly 1 each time.
+    #[test]
+    fn max_periods_one_processes_exactly_one_period() {
+        let (env, client, issuer, token, pt, _cid) = setup();
+        let holder = Address::generate(&env);
+
+        share(&client, &issuer, &token, &holder, 10_000);
+        dep(&client, &issuer, &token, &pt, 10_000, 1);
+        dep(&client, &issuer, &token, &pt, 20_000, 2);
+        dep(&client, &issuer, &token, &pt, 30_000, 3);
+
+        let p1 = client.claim(&holder, &issuer, &symbol_short!("def"), &token, &1);
+        assert_eq!(p1, 10_000);
+
+        let p2 = client.claim(&holder, &issuer, &symbol_short!("def"), &token, &1);
+        assert_eq!(p2, 20_000);
+
+        let p3 = client.claim(&holder, &issuer, &symbol_short!("def"), &token, &1);
+        assert_eq!(p3, 30_000);
+
+        assert!(!do_claim(&client, &holder, &issuer, &token, 1));
+        assert_eq!(balance(&env, &pt, &holder), 60_000);
+    }
+
+    // ── 10. Delay: only elapsed periods advance index ────────
+
+    /// When some periods have elapsed the delay and some have not, only the
+    /// elapsed ones are processed and the index advances to the first blocked period.
+    #[test]
+    fn delay_partial_window_advances_index_to_first_blocked() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let cid = env.register_contract(None, RevoraRevenueShare);
+        let client = RevoraRevenueShareClient::new(&env, &cid);
+        let issuer = Address::generate(&env);
+        let token = Address::generate(&env);
+        let (pt, pt_admin) = create_payment_token(&env);
+
+        client.register_offering(&issuer, &symbol_short!("def"), &token, &10_000, &pt, &3_600);
+        mint_tokens(&env, &pt, &pt_admin, &issuer, &1_000_000);
+
+        let holder = Address::generate(&env);
+        share(&client, &issuer, &token, &holder, 10_000);
+
+        // Deposit period 1 at t=0
+        env.ledger().with_mut(|li| li.timestamp = 0);
+        dep(&client, &issuer, &token, &pt, 10_000, 1);
+
+        // Deposit period 2 at t=7200 (2 hours later)
+        env.ledger().with_mut(|li| li.timestamp = 7_200);
+        dep(&client, &issuer, &token, &pt, 20_000, 2);
+
+        // At t=4000: period 1 elapsed (4000 > 0+3600), period 2 not (4000 < 7200+3600)
+        env.ledger().with_mut(|li| li.timestamp = 4_000);
+        let payout = client.claim(&holder, &issuer, &symbol_short!("def"), &token, &0);
+        assert_eq!(payout, 10_000); // only period 1
+
+        // Period 2 still pending
+        let pending = client.get_pending_periods(&issuer, &symbol_short!("def"), &token, &holder);
+        assert_eq!(pending.len(), 1);
+
+        // At t=11000: period 2 now elapsed (11000 > 7200+3600)
+        env.ledger().with_mut(|li| li.timestamp = 11_000);
+        let payout2 = client.claim(&holder, &issuer, &symbol_short!("def"), &token, &0);
+        assert_eq!(payout2, 20_000);
+
+        assert_eq!(balance(&env, &pt, &holder), 30_000);
+    }
+
+    // ── 11. Regression: index not written on NoPendingClaims ─
+
+    /// Regression: ensure that when NoPendingClaims is returned (start_idx >= period_count),
+    /// no storage write occurs. Verified by confirming a subsequent deposit is claimable.
+    #[test]
+    fn regression_no_state_write_on_no_pending_claims() {
+        let (env, client, issuer, token, pt, _cid) = setup();
+        let holder = Address::generate(&env);
+
+        share(&client, &issuer, &token, &holder, 10_000);
+        dep(&client, &issuer, &token, &pt, 50_000, 1);
+
+        // Claim period 1
+        client.claim(&holder, &issuer, &symbol_short!("def"), &token, &0);
+
+        // Trigger NoPendingClaims multiple times
+        for _ in 0..5 {
+            assert!(!do_claim(&client, &holder, &issuer, &token, 0));
+        }
+
+        // New deposit must be claimable — index was not corrupted
+        dep(&client, &issuer, &token, &pt, 30_000, 2);
+        let payout = client.claim(&holder, &issuer, &symbol_short!("def"), &token, &0);
+        assert_eq!(payout, 30_000);
+    }
+} // mod claim_idempotency
