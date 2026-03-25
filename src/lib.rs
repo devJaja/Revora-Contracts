@@ -102,24 +102,25 @@ const EVENT_REVENUE_REPORT_OVERRIDE: Symbol = symbol_short!("rev_ovrd");
 const EVENT_REVENUE_REPORT_OVERRIDE_ASSET: Symbol = symbol_short!("rev_ovra");
 const EVENT_REVENUE_REPORT_REJECTED: Symbol = symbol_short!("rev_rej");
 const EVENT_REVENUE_REPORT_REJECTED_ASSET: Symbol = symbol_short!("rev_reja");
-// Versioned event symbols (v1). We emit legacy events for compatibility
-// and also emit explicit v1 events that include a leading `version` field.
-const EVENT_OFFER_REG_V1: Symbol = symbol_short!("ofr_reg1");
-const EVENT_REV_INIT_V1: Symbol = symbol_short!("rv_init1");
-const EVENT_REV_INIA_V1: Symbol = symbol_short!("rv_inia1");
-const EVENT_REV_REP_V1: Symbol = symbol_short!("rv_rep1");
-const EVENT_REV_REPA_V1: Symbol = symbol_short!("rv_repa1");
+pub const EVENT_SCHEMA_VERSION_V2: u32 = 2;
 
-const EVENT_SCHEMA_VERSION: u32 = 1;
-const EVENT_CONCENTRATION_WARNING: Symbol = symbol_short!("conc_warn");
-const EVENT_REV_DEPOSIT: Symbol = symbol_short!("rev_dep");
-const EVENT_REV_DEP_SNAP: Symbol = symbol_short!("rev_snap");
-const EVENT_CLAIM: Symbol = symbol_short!("claim");
-const EVENT_SHARE_SET: Symbol = symbol_short!("share_set");
-const EVENT_FREEZE: Symbol = symbol_short!("freeze");
-const EVENT_CLAIM_DELAY_SET: Symbol = symbol_short!("delay_set");
+// Versioned event symbols (v2). All core events emit with leading `version` field.
+const EVENT_OFFER_REG_V2: Symbol = symbol_short!("ofr_reg2");
+const EVENT_REV_INIT_V2: Symbol = symbol_short!("rv_init2");
+const EVENT_REV_INIA_V2: Symbol = symbol_short!("rv_inia2");
+const EVENT_REV_REP_V2: Symbol = symbol_short!("rv_rep2");
+const EVENT_REV_REPA_V2: Symbol = symbol_short!("rv_repa2");
+const EVENT_REV_DEPOSIT_V2: Symbol = symbol_short!("rev_dep2");
+const EVENT_REV_DEP_SNAP_V2: Symbol = symbol_short!("rev_snp2");
+const EVENT_CLAIM_V2: Symbol = symbol_short!("claim2");
+const EVENT_SHARE_SET_V2: Symbol = symbol_short!("sh_set2");
+const EVENT_FREEZE_V2: Symbol = symbol_short!("frz2");
+const EVENT_CLAIM_DELAY_SET_V2: Symbol = symbol_short!("dly_set2");
+const EVENT_CONCENTRATION_WARNING_V2: Symbol = symbol_short!("conc2");
 
-const EVENT_PROPOSAL_CREATED: Symbol = symbol_short!("prop_new");
+const EVENT_PROPOSAL_CREATED_V2: Symbol = symbol_short!("prop_n2");
+const EVENT_PROPOSAL_APPROVED_V2: Symbol = symbol_short!("prop_a2");
+const EVENT_PROPOSAL_EXECUTED_V2: Symbol = symbol_short!("prop_e2");
 const EVENT_PROPOSAL_APPROVED: Symbol = symbol_short!("prop_app");
 const EVENT_PROPOSAL_EXECUTED: Symbol = symbol_short!("prop_exe");
 
@@ -439,8 +440,7 @@ pub enum DataKey {
     /// Global pause flag; when true, state-mutating ops are disabled (#7).
     Paused,
 
-    /// Feature flag: emit versioned events when present (v1 schema).
-    EventVersioningEnabled,
+
 
     /// Configuration flag: when true, contract is event-only (no persistent business state).
     EventOnlyMode,
@@ -497,10 +497,7 @@ pub struct RevoraRevenueShare;
 impl RevoraRevenueShare {
     const META_AUTH_VERSION: u32 = 1;
 
-    fn is_event_versioning_enabled(env: Env) -> bool {
-        let key = DataKey::EventVersioningEnabled;
-        env.storage().persistent().get::<DataKey, bool>(&key).unwrap_or(false)
-    }
+
 
     /// Returns error if contract is frozen (#32). Call at start of state-mutating entrypoints.
     fn require_not_frozen(env: &Env) -> Result<(), RevoraError> {
@@ -509,6 +506,17 @@ impl RevoraRevenueShare {
             return Err(RevoraError::ContractFrozen);
         }
         Ok(())
+    }
+
+    /// Helper to emit deterministic v2 versioned events for core event versioning.
+    /// Emits: topic -> (EVENT_SCHEMA_VERSION_V2, data...)
+    /// All core events MUST use this for schema compliance and indexer compatibility.
+    fn emit_v2_event<T: IntoVal<Env, Vec>>(
+        env: &Env,
+        topic_tuple: impl IntoVal<Env, (Symbol,)>,
+        data: T,
+    ) {
+        env.events().publish(topic_tuple, (EVENT_SCHEMA_VERSION_V2, data));
     }
 
     fn validate_window(window: &AccessWindow) -> Result<(), RevoraError> {
@@ -611,8 +619,12 @@ impl RevoraRevenueShare {
         env.storage()
             .persistent()
             .set(&DataKey::HolderShare(offering_id, holder.clone()), &share_bps);
-        env.events()
-            .publish((EVENT_SHARE_SET, issuer, namespace, token), (holder, share_bps));
+        /// Versioned event v2: [version: u32, holder: Address, share_bps: u32]
+        Self::emit_v2_event(
+            env,
+            (EVENT_SHARE_SET_V2, issuer.clone(), namespace.clone(), token.clone()),
+            (holder.clone(), share_bps)
+        );
         Ok(())
     }
 
@@ -705,9 +717,11 @@ impl RevoraRevenueShare {
             );
         }
 
-        env.events().publish(
-            (EVENT_REV_DEPOSIT, issuer, namespace, token),
-            (payment_token, amount, period_id),
+        /// Versioned event v2: [version: u32, payment_token: Address, amount: i128, period_id: u64]
+        Self::emit_v2_event(
+            env,
+            (EVENT_REV_DEPOSIT_V2, issuer.clone(), namespace.clone(), token.clone()),
+            (payment_token, amount, period_id)
         );
         Ok(())
     }
@@ -993,13 +1007,13 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
             (revenue_share_bps, payout_asset.clone()),
         );
 
-        // Optionally emit a versioned v1 event with explicit version field
-        if Self::is_event_versioning_enabled(env.clone()) {
-            env.events().publish(
-                (EVENT_OFFER_REG_V1, issuer.clone(), namespace.clone()),
-                (EVENT_SCHEMA_VERSION, token.clone(), revenue_share_bps, payout_asset.clone()),
-            );
-        }
+        // Always emit v2 versioned event (deterministic emission for core event version field)
+        /// Versioned event v2: [version: u32, token: Address, revenue_share_bps: u32, payout_asset: Address]
+        Self::emit_v2_event(
+            &env,
+            (EVENT_OFFER_REG_V2, issuer.clone(), namespace.clone()),
+            (token.clone(), revenue_share_bps, payout_asset.clone())
+        );
         Ok(())
     }
 
@@ -1305,28 +1319,34 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
         summary.total_revenue = summary.total_revenue.saturating_add(amount);
         summary.report_count = summary.report_count.saturating_add(1);
         env.storage().persistent().set(&summary_key, &summary);
-        // Optionally emit versioned v1 events for forward-compatible consumers
-        if Self::is_event_versioning_enabled(env.clone()) {
-            env.events().publish(
-                (EVENT_REV_INIT_V1, issuer.clone(), namespace.clone(), token.clone()),
-                (EVENT_SCHEMA_VERSION, amount, period_id, blacklist.clone()),
-            );
+// Always emit deterministic v2 versioned events (remove v1 conditional emission)
+        /// Versioned event v2: [version: u32, amount: i128, period_id: u64, blacklist: Vec<Address>]
+        Self::emit_v2_event(
+            &env,
+            (EVENT_REV_INIT_V2, issuer.clone(), namespace.clone(), token.clone()),
+            (amount, period_id, blacklist.clone())
+        );
 
-            env.events().publish(
-                (EVENT_REV_INIA_V1, issuer.clone(), namespace.clone(), token.clone()),
-                (EVENT_SCHEMA_VERSION, payout_asset.clone(), amount, period_id, blacklist.clone()),
-            );
+        /// Versioned event v2: [version: u32, payout_asset: Address, amount: i128, period_id: u64, blacklist: Vec<Address>]
+        Self::emit_v2_event(
+            &env,
+            (EVENT_REV_INIA_V2, issuer.clone(), namespace.clone(), token.clone()),
+            (payout_asset.clone(), amount, period_id, blacklist.clone())
+        );
 
-            env.events().publish(
-                (EVENT_REV_REP_V1, issuer.clone(), namespace.clone(), token.clone()),
-                (EVENT_SCHEMA_VERSION, amount, period_id, blacklist.clone()),
-            );
+        /// Versioned event v2: [version: u32, amount: i128, period_id: u64, blacklist: Vec<Address>]
+        Self::emit_v2_event(
+            &env,
+            (EVENT_REV_REP_V2, issuer.clone(), namespace.clone(), token.clone()),
+            (amount, period_id, blacklist.clone())
+        );
 
-            env.events().publish(
-                (EVENT_REV_REPA_V1, issuer.clone(), namespace.clone(), token.clone()),
-                (EVENT_SCHEMA_VERSION, payout_asset.clone(), amount, period_id),
-            );
-        }
+        /// Versioned event v2: [version: u32, payout_asset: Address, amount: i128, period_id: u64]
+        Self::emit_v2_event(
+            &env,
+            (EVENT_REV_REPA_V2, issuer.clone(), namespace.clone(), token.clone()),
+            (payout_asset.clone(), amount, period_id)
+        );
 
         if !event_only {
             // Audit log summary (#34): maintain per-offering total revenue and report count
@@ -2164,9 +2184,11 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
 
         // 4. Update last snapshot and emit specialized event
         env.storage().persistent().set(&snap_key, &snapshot_reference);
-        env.events().publish(
-            (EVENT_REV_DEP_SNAP, issuer, namespace, token),
-            (payment_token, amount, period_id, snapshot_reference),
+        /// Versioned event v2: [version: u32, payment_token: Address, amount: i128, period_id: u64, snapshot_reference: u64]
+        Self::emit_v2_event(
+            &env,
+            (EVENT_REV_DEP_SNAP_V2, issuer.clone(), namespace.clone(), token.clone()),
+            (payment_token, amount, period_id, snapshot_reference)
         );
 
         Ok(())
@@ -3064,7 +3086,8 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
         admin.require_auth();
         let frozen_key = DataKey::Frozen;
         env.storage().persistent().set(&frozen_key, &true);
-        env.events().publish((EVENT_FREEZE, admin), true);
+        /// Versioned event v2: [version: u32, frozen: bool]
+        Self::emit_v2_event(&env, (EVENT_FREEZE_V2,), true);
         Ok(())
     }
 
