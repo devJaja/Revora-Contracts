@@ -9,75 +9,195 @@ use soroban_sdk::{
 // Issue #109 — Revenue report correction workflow with audit trail.
 // Placeholder branch for upstream PR scaffolding; full implementation in follow-up.
 
-/// Centralized contract error codes. Auth failures are signaled by host panic (require_auth).
+/// Centralized contract error codes.
+///
+/// All state-mutating entrypoints return `Result<_, RevoraError>` so callers can
+/// distinguish contract-level rejections from host-level auth panics.  Use the
+/// `try_*` client methods to receive these as `Result`.
+///
+/// Auth failures (wrong signer) are signaled by host panic, not `RevoraError`.
+///
+/// # Numeric stability
+/// Each variant's discriminant is fixed and must never be renumbered; integrators
+/// may store or transmit the raw `u32` value.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 #[repr(u32)]
 pub enum RevoraError {
-    /// revenue_share_bps exceeded 10000 (100%).
+    /// `register_offering`: `revenue_share_bps` > 10 000 (100 %).
+    ///
+    /// Testnet mode bypasses this check to allow flexible testing.
+    /// Discriminant: 1.
     InvalidRevenueShareBps = 1,
-    /// Reserved for future use (e.g. offering limit per issuer).
+
+    /// General guard for operations that are structurally disallowed in the
+    /// current contract state (e.g. admin already set, multisig already
+    /// initialized, threshold out of range, fee above maximum).
+    ///
+    /// Also returned by `set_platform_fee` / `set_offering_fee_bps` when
+    /// `fee_bps > 5 000`.
+    /// Discriminant: 2.
     LimitReached = 2,
-    /// Holder concentration exceeds configured limit and enforcement is enabled.
+
+    /// `report_revenue`: the last reported single-holder concentration exceeds
+    /// the configured `max_bps` limit **and** `enforce` is `true`.
+    ///
+    /// Call `report_concentration` to update the stored value, or lower the
+    /// limit via `set_concentration_limit`.
+    /// Discriminant: 3.
     ConcentrationLimitExceeded = 3,
-    /// No offering found for the given (issuer, token) pair.
+
+    /// The requested `(issuer, namespace, token)` triple has no registered
+    /// offering, or the caller is not the current issuer of that offering.
+    ///
+    /// Returned by any issuer-gated entrypoint when the offering lookup fails.
+    /// Discriminant: 4.
     OfferingNotFound = 4,
-    /// Revenue already deposited for this period.
+
+    /// `deposit_revenue`: revenue has already been deposited for this
+    /// `period_id`.  Each period may only be deposited once.
+    /// Discriminant: 5.
     PeriodAlreadyDeposited = 5,
-    /// No unclaimed periods for this holder.
+
+    /// `claim`: the holder has no share allocated (`share_bps == 0`) or all
+    /// deposited periods have already been claimed.
+    /// Discriminant: 6.
     NoPendingClaims = 6,
-    /// Holder is blacklisted for this offering.
+
+    /// `claim`: the holder is on the per-offering blacklist and cannot receive
+    /// revenue.  Blacklisted holders retain their `share_bps` but cannot call
+    /// `claim` until removed from the blacklist.
+    /// Discriminant: 7.
     HolderBlacklisted = 7,
-    /// Holder share_bps exceeded 10000 (100%).
+
+    /// `set_holder_share`: `share_bps` > 10 000 (100 %).
+    /// Discriminant: 8.
     InvalidShareBps = 8,
-    /// Payment token does not match previously set token for this offering.
+
+    /// `deposit_revenue`: the supplied `payment_token` differs from the token
+    /// locked on the first deposit for this offering.  The payment token is
+    /// immutable after the first deposit.
+    /// Discriminant: 9.
     PaymentTokenMismatch = 9,
-    /// Contract is frozen; state-changing operations are disabled.
+
+    /// The contract is frozen; all state-mutating operations are disabled.
+    ///
+    /// Read-only queries and `claim` remain available.  Unfreeze requires a
+    /// new deployment or multisig action (depending on configuration).
+    /// Discriminant: 10.
     ContractFrozen = 10,
-    /// Revenue for this period is not yet claimable (delay not elapsed).
+
+    /// `claim`: the next claimable period has not yet passed the configured
+    /// `ClaimDelaySecs` window.  The caller should retry after the delay
+    /// elapses.
+    /// Discriminant: 11.
     ClaimDelayNotElapsed = 11,
 
-    /// Snapshot distribution is not enabled for this offering.
+    /// `deposit_revenue_with_snapshot`: snapshot-based distribution is not
+    /// enabled for this offering.  Call `set_snapshot_config(true)` first.
+    /// Discriminant: 12.
     SnapshotNotEnabled = 12,
-    /// Provided snapshot reference is outdated or duplicates a previous one.
+
+    /// `deposit_revenue_with_snapshot`: the supplied `snapshot_reference` is
+    /// not strictly greater than the last recorded reference.  Snapshots must
+    /// be monotonically increasing to prevent replay.
+    /// Discriminant: 13.
     OutdatedSnapshot = 13,
-    /// Payout asset does not match the configured payout asset for this offering.
+
+    /// `report_revenue`: the supplied `payout_asset` does not match the
+    /// `payout_asset` recorded in the offering at registration time.
+    /// Discriminant: 14.
     PayoutAssetMismatch = 14,
-    /// A transfer is already pending for this offering.
+
+    /// `propose_issuer_transfer`: a transfer is already pending for this
+    /// offering.  Cancel the existing proposal before proposing a new one.
+    /// Discriminant: 15.
     IssuerTransferPending = 15,
-    /// No transfer is pending for this offering.
+
+    /// `accept_issuer_transfer` / `cancel_issuer_transfer`: no transfer is
+    /// currently pending for this offering.
+    /// Discriminant: 16.
     NoTransferPending = 16,
-    /// Caller is not authorized to accept this transfer.
-    UnauthorizedTransferAccept = 17,
-    /// Metadata string exceeds maximum allowed length.
-    MetadataTooLarge = 18,
-    /// Caller is not authorized to perform this action.
-    NotAuthorized = 19,
-    /// Contract is not initialized (admin not set).
-    NotInitialized = 20,
-    /// Amount is invalid (e.g. negative for deposit, or out of allowed range) (#35).
-    InvalidAmount = 21,
-    /// period_id is invalid (e.g. zero when required to be positive) (#35).
-    InvalidPeriodId = 22,
-    /// Deposit would exceed the offering's supply cap (#96).
-    SupplyCapExceeded = 23,
-    /// Metadata format is invalid for configured scheme rules.
-    MetadataInvalidFormat = 24,
-    /// Current ledger timestamp is outside configured reporting window.
-    ReportingWindowClosed = 25,
-    /// Current ledger timestamp is outside configured claiming window.
-    ClaimWindowClosed = 26,
-    /// Off-chain signature has expired.
-    SignatureExpired = 27,
-    /// Signature nonce has already been used.
-    SignatureReplay = 28,
-    /// Off-chain signer key has not been registered.
-    SignerKeyNotRegistered = 29,
-    /// The sum of all holder share_bps for an offering would exceed 10 000 (100 %).
+
+    /// `accept_issuer_transfer`: the caller is not the address that was
+    /// nominated as the new issuer in the pending transfer proposal.
     ///
-    /// Raised by `set_holder_share` when adding or updating a holder's share would
-    /// push the per-offering total above the 10 000 bps ceiling.  The caller must
-    /// reduce another holder's share first, or lower the requested value.
+    /// Security note: this is a typed error rather than a host panic so that
+    /// callers can distinguish "wrong acceptor" from "no pending transfer".
+    /// Discriminant: 17.
+    UnauthorizedTransferAccept = 17,
+
+    /// `set_offering_metadata`: the metadata string exceeds
+    /// `MAX_METADATA_LENGTH` (256 bytes).
+    /// Discriminant: 18.
+    MetadataTooLarge = 18,
+
+    /// `meta_set_holder_share` / `meta_approve_revenue_report`: the signer is
+    /// not the configured delegate for this offering.
+    /// Discriminant: 19.
+    NotAuthorized = 19,
+
+    /// A required admin address has not been set.
+    ///
+    /// Returned by `require_admin` when `DataKey::Admin` is absent.  This
+    /// indicates the contract was not properly initialized before use.
+    /// Discriminant: 20.
+    NotInitialized = 20,
+
+    /// `report_revenue` / `set_min_revenue_threshold`: `amount` is negative.
+    /// `deposit_revenue`: `amount` <= 0.
+    /// `set_investment_constraints`: `min_stake` or `max_stake` is negative.
+    /// Discriminant: 21.
+    InvalidAmount = 21,
+
+    /// `deposit_revenue`: `period_id` is 0.  Period IDs must be positive to
+    /// avoid ambiguity with the "no period" sentinel.
+    /// Discriminant: 22.
+    InvalidPeriodId = 22,
+
+    /// `deposit_revenue`: the cumulative deposited revenue for this offering
+    /// would exceed the configured supply cap.
+    /// Discriminant: 23.
+    SupplyCapExceeded = 23,
+
+    /// `set_offering_metadata`: the metadata string does not start with a
+    /// recognised scheme prefix (`ipfs://`, `https://`, `ar://`, `sha256:`).
+    /// Discriminant: 24.
+    MetadataInvalidFormat = 24,
+
+    /// `report_revenue`: the current ledger timestamp is outside the
+    /// configured reporting window for this offering.
+    /// Discriminant: 25.
+    ReportingWindowClosed = 25,
+
+    /// `claim`: the current ledger timestamp is outside the configured
+    /// claiming window for this offering.
+    /// Discriminant: 26.
+    ClaimWindowClosed = 26,
+
+    /// `meta_set_holder_share` / `meta_approve_revenue_report`: the
+    /// off-chain signature's `expiry` timestamp is in the past.
+    /// Discriminant: 27.
+    SignatureExpired = 27,
+
+    /// `meta_set_holder_share` / `meta_approve_revenue_report`: the nonce
+    /// has already been consumed.  Each nonce may only be used once per
+    /// signer to prevent replay attacks.
+    /// Discriminant: 28.
+    SignatureReplay = 28,
+
+    /// `meta_set_holder_share` / `meta_approve_revenue_report`: no ed25519
+    /// public key has been registered for the signer address.  Call
+    /// `register_meta_signer_key` first.
+    /// Discriminant: 29.
+    SignerKeyNotRegistered = 29,
+
+    /// `set_holder_share`: adding or updating this holder's share would push
+    /// the per-offering aggregate above 10 000 bps (100 %).
+    ///
+    /// Reduce another holder's share first, or lower the requested value.
+    /// Use `get_total_share_bps` to inspect the current aggregate.
+    /// Discriminant: 30.
     ShareSumExceeded = 30,
 }
 
@@ -516,6 +636,16 @@ impl RevoraRevenueShare {
             return Err(RevoraError::ContractFrozen);
         }
         Ok(())
+    }
+
+    /// Returns the admin address or `Err(NotInitialized)` if the contract has
+    /// not been initialized yet.  Use this instead of `.expect("admin not set")`
+    /// in entrypoints that should surface a typed error rather than panic.
+    fn require_admin(env: &Env) -> Result<Address, RevoraError> {
+        env.storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .ok_or(RevoraError::NotInitialized)
     }
 
     fn validate_window(window: &AccessWindow) -> Result<(), RevoraError> {
@@ -3247,8 +3377,15 @@ impl RevoraRevenueShare {
     }
 
     /// Accept a pending issuer transfer. Only the proposed new issuer may call this.
+    ///
+    /// # Parameters
+    /// - `caller`: The address attempting to accept the transfer.  Must match
+    ///   the address nominated in `propose_issuer_transfer`; otherwise returns
+    ///   `Err(UnauthorizedTransferAccept)`.
+    /// - `issuer`: The current (old) issuer, used to locate the offering.
     pub fn accept_issuer_transfer(
         env: Env,
+        caller: Address,
         issuer: Address,
         namespace: Symbol,
         token: Address,
@@ -3265,6 +3402,13 @@ impl RevoraRevenueShare {
         let pending_key = DataKey::PendingIssuerTransfer(offering_id.clone());
         let new_issuer: Address =
             env.storage().persistent().get(&pending_key).ok_or(RevoraError::NoTransferPending)?;
+
+        // Typed check: caller must be the nominated new issuer.
+        // Returns UnauthorizedTransferAccept rather than panicking so callers
+        // can distinguish "wrong acceptor" from "no pending transfer".
+        if caller != new_issuer {
+            return Err(RevoraError::UnauthorizedTransferAccept);
+        }
 
         // Only the proposed new issuer can accept
         new_issuer.require_auth();
@@ -3692,12 +3836,13 @@ impl RevoraRevenueShare {
     // ── Testnet mode configuration (#24) ───────────────────────
 
     /// Enable or disable testnet mode. Only admin may call.
+    ///
+    /// Returns `Err(NotInitialized)` if the contract admin has not been set yet,
+    /// allowing callers to distinguish "not initialized" from other auth failures.
     /// When enabled, certain validations are relaxed for testnet deployments.
     /// Emits event with new mode state.
     pub fn set_testnet_mode(env: Env, enabled: bool) -> Result<(), RevoraError> {
-        let key = DataKey::Admin;
-        let admin: Address =
-            env.storage().persistent().get(&key).ok_or(RevoraError::LimitReached)?;
+        let admin = Self::require_admin(&env)?;
         admin.require_auth();
         if !Self::is_event_only(&env) {
             let mode_key = DataKey::TestnetMode;
@@ -3961,6 +4106,8 @@ mod test_utils;
 
 #[cfg(test)]
 mod chunking_tests;
+#[cfg(test)]
+mod structured_error_tests;
 mod test;
 mod test_auth;
 mod test_cross_contract;

@@ -3829,7 +3829,7 @@ fn issuer_transfer_accept_completes_transfer() {
     let new_issuer = Address::generate(&env);
 
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &new_issuer);
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
 
     // Verify no pending transfer after acceptance
     assert_eq!(client.get_pending_issuer_transfer(&issuer, &symbol_short!("def"), &token), None);
@@ -3847,7 +3847,7 @@ fn issuer_transfer_accept_emits_event() {
 
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &new_issuer);
     let before = env.events().all().len();
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
     assert!(env.events().all().len() > before);
 }
 
@@ -3861,7 +3861,7 @@ fn issuer_transfer_new_issuer_can_deposit_revenue() {
     mint_tokens(&env, &payment_token, &pt_admin, &new_issuer, &5_000_000);
 
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &new_issuer);
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
 
     // New issuer should be able to deposit revenue
     let result = client.try_deposit_revenue(
@@ -3990,7 +3990,7 @@ fn issuer_transfer_new_issuer_can_set_holder_share() {
     let holder = Address::generate(&env);
 
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &new_issuer);
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
 
     // New issuer should be able to set holder shares
     let result =
@@ -4005,7 +4005,7 @@ fn issuer_transfer_old_issuer_loses_access() {
     let new_issuer = Address::generate(&env);
 
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &new_issuer);
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
 
     // Old issuer should not be able to deposit revenue
     let result = client.try_deposit_revenue(
@@ -4026,7 +4026,7 @@ fn issuer_transfer_old_issuer_cannot_set_holder_share() {
     let holder = Address::generate(&env);
 
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &new_issuer);
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
 
     // Old issuer should not be able to set holder shares
     let result =
@@ -4242,9 +4242,11 @@ fn issuer_transfer_cannot_propose_when_already_pending() {
 
 #[test]
 fn issuer_transfer_cannot_accept_when_no_pending() {
-    let (_env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let any_caller = Address::generate(&env);
 
-    let result = client.try_accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    let result =
+        client.try_accept_issuer_transfer(&any_caller, &issuer, &symbol_short!("def"), &token);
     assert!(result.is_err());
 }
 
@@ -4281,9 +4283,10 @@ fn issuer_transfer_accept_requires_auth() {
     let token = Address::generate(&env);
 
     let _issuer = Address::generate(&env);
+    let _new_issuer = Address::generate(&env);
 
     // No mock_all_auths - should panic
-    client.accept_issuer_transfer(&_issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&_new_issuer, &_issuer, &symbol_short!("def"), &token);
 }
 
 #[test]
@@ -4306,10 +4309,11 @@ fn issuer_transfer_double_accept_fails() {
     let new_issuer = Address::generate(&env);
 
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &new_issuer);
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
 
     // Second accept should fail (no pending transfer)
-    let result = client.try_accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    let result =
+        client.try_accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
     assert!(result.is_err());
 }
 
@@ -4324,7 +4328,7 @@ fn issuer_transfer_to_same_address() {
         client.try_propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &issuer);
     assert!(result.is_ok());
 
-    let result = client.try_accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    let result = client.try_accept_issuer_transfer(&issuer, &issuer, &symbol_short!("def"), &token);
     assert!(result.is_ok());
 }
 
@@ -4343,7 +4347,7 @@ fn issuer_transfer_multiple_offerings_isolation() {
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token_b, &new_issuer_b);
 
     // Accept only token_a transfer
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token_a);
+    client.accept_issuer_transfer(&new_issuer_a, &issuer, &symbol_short!("def"), &token_a);
 
     // Verify token_a transferred but token_b still pending
     assert_eq!(client.get_pending_issuer_transfer(&issuer, &symbol_short!("def"), &token_a), None);
@@ -4776,7 +4780,8 @@ fn issuer_transfer_accept_blocked_when_frozen() {
     client.set_admin(&admin);
     client.freeze();
 
-    let result = client.try_accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    let result =
+        client.try_accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
     assert!(result.is_err());
 }
 
@@ -4816,7 +4821,7 @@ fn issuer_transfer_preserves_audit_summary() {
 
     // Transfer issuer
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &new_issuer);
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
 
     // Audit summary should still be accessible
     let summary_after = client.get_audit_summary(&issuer, &symbol_short!("def"), &token).unwrap();
@@ -4830,7 +4835,7 @@ fn issuer_transfer_new_issuer_can_report_revenue() {
     let new_issuer = Address::generate(&env);
 
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &new_issuer);
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
 
     // New issuer can report revenue
     let result = client.try_report_revenue(
@@ -4851,7 +4856,7 @@ fn issuer_transfer_new_issuer_can_set_concentration_limit() {
     let new_issuer = Address::generate(&env);
 
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &new_issuer);
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
 
     // New issuer can set concentration limit
     let result = client.try_set_concentration_limit(
@@ -4870,7 +4875,7 @@ fn issuer_transfer_new_issuer_can_set_rounding_mode() {
     let new_issuer = Address::generate(&env);
 
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &new_issuer);
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
 
     // New issuer can set rounding mode
     let result = client.try_set_rounding_mode(
@@ -4888,7 +4893,7 @@ fn issuer_transfer_new_issuer_can_set_claim_delay() {
     let new_issuer = Address::generate(&env);
 
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &new_issuer);
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
 
     // New issuer can set claim delay
     let result = client.try_set_claim_delay(&new_issuer, &symbol_short!("def"), &token, &3600);
@@ -4907,7 +4912,7 @@ fn issuer_transfer_holders_can_still_claim() {
 
     // Transfer issuer
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &new_issuer);
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
 
     // Holder should still be able to claim
     let payout = client.claim(&holder, &issuer, &symbol_short!("def"), &token, &0);
@@ -4925,7 +4930,7 @@ fn issuer_transfer_then_new_deposits_and_claims_work() {
 
     // Transfer issuer
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &new_issuer);
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
 
     // New issuer sets share and deposits
     client.set_holder_share(&new_issuer, &symbol_short!("def"), &token, &holder, &5_000);
@@ -4949,7 +4954,7 @@ fn issuer_transfer_get_offering_still_works() {
     let new_issuer = Address::generate(&env);
 
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &new_issuer);
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
 
     // get_offering should find the offering under new issuer now
     let offering = client.get_offering(&new_issuer, &symbol_short!("def"), &token);
@@ -4965,7 +4970,7 @@ fn issuer_transfer_preserves_revenue_share_bps() {
     let offering_before = client.get_offering(&issuer, &symbol_short!("def"), &token);
 
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &new_issuer);
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
 
     let offering_after = client.get_offering(&new_issuer, &symbol_short!("def"), &token);
     assert_eq!(
@@ -4980,7 +4985,7 @@ fn issuer_transfer_old_issuer_cannot_report_concentration() {
     let new_issuer = Address::generate(&env);
 
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &new_issuer);
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
 
     // Old issuer should not be able to report concentration
     let result = client.try_report_concentration(&issuer, &symbol_short!("def"), &token, &5_000);
@@ -4995,7 +5000,7 @@ fn issuer_transfer_new_issuer_can_report_concentration() {
     client.set_concentration_limit(&issuer, &symbol_short!("def"), &token, &6_000, &false);
 
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &new_issuer);
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
 
     // New issuer can report concentration
     let result =
@@ -6319,7 +6324,7 @@ fn test_metadata_after_issuer_transfer() {
 
     // Propose and accept transfer
     client.propose_issuer_transfer(&old_issuer, &symbol_short!("def"), &token, &new_issuer);
-    client.accept_issuer_transfer(&old_issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &old_issuer, &symbol_short!("def"), &token);
 
     // Metadata should still be accessible under old issuer key
     let retrieved = client.get_offering_metadata(&old_issuer, &symbol_short!("def"), &token);
