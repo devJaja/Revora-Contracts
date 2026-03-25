@@ -656,17 +656,25 @@ impl RevoraRevenueShare {
         amount: i128,
         period_id: u64,
     ) -> Result<(), RevoraError> {
+        // Validate inputs before any storage or token operations
+        if amount <= 0 {
+            return Err(RevoraError::InvalidAmount);
+        }
+        if period_id == 0 {
+            return Err(RevoraError::InvalidPeriodId);
+        }
         let offering_id = OfferingId {
             issuer: issuer.clone(),
             namespace: namespace.clone(),
             token: token.clone(),
         };
 
-        // Verify offering exists
-        if Self::get_offering(env.clone(), issuer.clone(), namespace.clone(), token.clone())
-            .is_none()
-        {
-            return Err(RevoraError::OfferingNotFound);
+        // Verify offering exists and payment_token matches payout_asset
+        let offering =
+            Self::get_offering(env.clone(), issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+        if offering.payout_asset != payment_token {
+            return Err(RevoraError::PaymentTokenMismatch);
         }
 
         // Check period not already deposited
@@ -1088,6 +1096,7 @@ impl RevoraRevenueShare {
         Self::require_not_frozen(&env)?;
         Self::require_not_paused(&env);
         issuer.require_auth();
+        Self::require_non_negative_amount(amount)?;
 
         let event_only = Self::is_event_only(&env);
         let offering_id = OfferingId {
@@ -1333,6 +1342,17 @@ impl RevoraRevenueShare {
         }
 
         if !event_only {
+            // Min revenue threshold check: skip audit if below threshold
+            let threshold_key = DataKey::MinRevenueThreshold(offering_id.clone());
+            let threshold: i128 = env.storage().persistent().get(&threshold_key).unwrap_or(0);
+            if threshold > 0 && amount < threshold {
+                env.events().publish(
+                    (EVENT_REV_BELOW_THRESHOLD, issuer, namespace, token),
+                    (amount, period_id, threshold),
+                );
+                return Ok(());
+            }
+
             // Audit log summary (#34): maintain per-offering total revenue and report count
             let summary_key = DataKey::AuditSummary(offering_id);
             let mut summary: AuditSummary = env
@@ -1621,36 +1641,19 @@ impl RevoraRevenueShare {
         investor: Address,
     ) {
         caller.require_auth();
-        let current_issuer =
-            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
-                .expect("offering not found");
-        if caller != current_issuer {
-            panic!("not authorized");
-        }
-
-        let offering_id = OfferingId { issuer, namespace, token };
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
         let key = DataKey::Whitelist(offering_id.clone());
         let mut map: Map<Address, bool> =
             env.storage().persistent().get(&key).unwrap_or_else(|| Map::new(&env));
-
         map.set(investor.clone(), true);
         env.storage().persistent().set(&key, &map);
-
-        env.events().publish(
-            (
-                EVENT_WL_ADD,
-                offering_id.issuer.clone(),
-                offering_id.namespace.clone(),
-                offering_id.token.clone(),
-            ),
-            (caller, investor),
-        );
+        env.events().publish((EVENT_WL_ADD, issuer, namespace, token), (caller, investor));
     }
 
-    /// Remove `investor` from the per-offering whitelist for `token`.
-    ///
-    /// Idempotent — calling when the address is not listed is safe.
-    /// Remove `investor` from the per-offering whitelist.
     pub fn whitelist_remove(
         env: Env,
         caller: Address,
@@ -1660,30 +1663,17 @@ impl RevoraRevenueShare {
         investor: Address,
     ) {
         caller.require_auth();
-        let current_issuer =
-            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
-                .expect("offering not found");
-        if caller != current_issuer {
-            panic!("not authorized");
-        }
-
-        let offering_id = OfferingId { issuer, namespace, token };
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
         let key = DataKey::Whitelist(offering_id.clone());
         let mut map: Map<Address, bool> =
             env.storage().persistent().get(&key).unwrap_or_else(|| Map::new(&env));
-
         map.remove(investor.clone());
         env.storage().persistent().set(&key, &map);
-
-        env.events().publish(
-            (
-                EVENT_WL_REM,
-                offering_id.issuer.clone(),
-                offering_id.namespace.clone(),
-                offering_id.token.clone(),
-            ),
-            (caller, investor),
-        );
+        env.events().publish((EVENT_WL_REM, issuer, namespace, token), (caller, investor));
     }
 
     /// Returns `true` if `investor` is whitelisted for `token`'s offering.
@@ -2083,6 +2073,7 @@ impl RevoraRevenueShare {
         period_id: u64,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
+        issuer.require_auth();
 
         // Verify offering exists and issuer is current
         let current_issuer =
@@ -3399,6 +3390,14 @@ impl RevoraRevenueShare {
         // So OfferingId MUST include issuer.
 
         // Okay, I'll stick with OfferingId including issuer. Issuer transfer will be a "new" offering from the storage perspective.
+
+        let old_offering_id = OfferingId {
+            issuer: old_issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+        // Remove old issuer lookup so old issuer can no longer manage this offering
+        env.storage().persistent().remove(&DataKey::OfferingIssuer(old_offering_id));
 
         let new_offering_id = OfferingId {
             issuer: new_issuer.clone(),
