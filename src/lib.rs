@@ -472,11 +472,8 @@ pub enum DataKey {
     /// Global pause flag; when true, state-mutating ops are disabled (#7).
     Paused,
 
-    /// Feature flag: emit versioned events when present (v1 schema).
-    EventVersioningEnabled,
-
-    /// Configuration flag: when true, contract is event-only (no persistent business state).
-    EventOnlyMode,
+    /// Contract-level boolean flags: (event_versioning_enabled, event_only_mode).
+    ContractFlags,
 
     /// Metadata reference (IPFS hash, HTTPS URI, etc.) for an offering.
     OfferingMetadata(OfferingId),
@@ -531,8 +528,12 @@ impl RevoraRevenueShare {
     const META_AUTH_VERSION: u32 = 1;
 
     fn is_event_versioning_enabled(env: Env) -> bool {
-        let key = DataKey::EventVersioningEnabled;
-        env.storage().persistent().get::<DataKey, bool>(&key).unwrap_or(false)
+        let (versioning, _): (bool, bool) = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ContractFlags)
+            .unwrap_or((false, false));
+        versioning
     }
 
     /// Returns error if contract is frozen (#32). Call at start of state-mutating entrypoints.
@@ -749,7 +750,12 @@ impl RevoraRevenueShare {
 
     /// Return true if the contract is in event-only mode.
     pub fn is_event_only(env: &Env) -> bool {
-        env.storage().persistent().get::<DataKey, bool>(&DataKey::EventOnlyMode).unwrap_or(false)
+        let (_, event_only): (bool, bool) = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ContractFlags)
+            .unwrap_or((false, false));
+        event_only
     }
 
     /// Input validation (#35): require amount > 0 for transfers/deposits.
@@ -813,7 +819,7 @@ impl RevoraRevenueShare {
         }
         env.storage().persistent().set(&DataKey::Paused, &false);
         let eo = event_only.unwrap_or(false);
-        env.storage().persistent().set(&DataKey::EventOnlyMode, &eo);
+        env.storage().persistent().set(&DataKey::ContractFlags, &(false, eo));
         env.events().publish((EVENT_INIT, admin.clone()), (safety, eo));
     }
 
@@ -2373,35 +2379,15 @@ impl RevoraRevenueShare {
     /// Apply a batch of holder shares for a committed snapshot.
     ///
     /// Writes `(holder, share_bps)` pairs into persistent storage indexed by
-    /// `(offering_id, snapshot_ref, sequential_index)`. Also updates the live
-    /// `HolderShare` for each holder so they can claim revenue deposited against
-    /// this snapshot.
-    ///
-    /// Batches are bounded by `MAX_SNAPSHOT_BATCH` (50) per call. Callers must
-    /// iterate with increasing `start_index` until all holders are written.
-    ///
-    /// The `SnapshotEntry.holder_count` and `total_bps` fields are updated
-    /// atomically after each batch to reflect the cumulative state.
-    ///
-    /// ### Idempotency
-    /// Re-writing the same `(snapshot_ref, start_index + i)` slot overwrites with
-    /// the same value. Callers should not re-apply batches unless correcting an error
-    /// before the snapshot is used for a deposit.
+    /// `(offering_id, snapshot_ref, sequential_index)`. Batches are bounded by
+    /// `MAX_SNAPSHOT_BATCH` (50) per call. Updates `HolderShare` for each holder.
     ///
     /// ### Auth
     /// Requires `issuer.require_auth()`. Only the current offering issuer may apply.
     ///
     /// ### Errors
-    /// - `OfferingNotFound`: offering does not exist or caller is not current issuer.
-    /// - `SnapshotNotEnabled`: snapshot distribution is not enabled.
-    /// - `OutdatedSnapshot`: `snapshot_ref` does not match a committed entry.
-    /// - `LimitReached`: `holders` slice exceeds `MAX_SNAPSHOT_BATCH`.
-    /// - `InvalidShareBps`: any `share_bps` > 10000.
-    /// - `ContractFrozen` / paused: contract is not operational.
-    ///
-    /// ### Events
-    /// Emits `snap_shr` with `(issuer, namespace, token)` topics and
-    /// `(snapshot_ref, start_index, batch_len, new_total_bps)` data.
+    /// - `OfferingNotFound`, `SnapshotNotEnabled`, `OutdatedSnapshot`,
+    ///   `LimitReached`, `InvalidShareBps`, `ContractFrozen`.
     pub fn apply_snapshot_shares(
         env: Env,
         issuer: Address,
@@ -2461,7 +2447,7 @@ impl RevoraRevenueShare {
         let mut added_bps: u32 = 0;
         for i in 0..batch_len {
             let (holder, share_bps) = holders.get(i).unwrap();
-            let slot = start_index.saturating_add(i as u32);
+            let slot = start_index.saturating_add(i);
 
             // Write indexed slot for deterministic enumeration.
             env.storage().persistent().set(
@@ -2479,7 +2465,7 @@ impl RevoraRevenueShare {
         }
 
         // Update snapshot metadata.
-        let new_holder_count = entry.holder_count.saturating_add(batch_len as u32);
+        let new_holder_count = entry.holder_count.saturating_add(batch_len);
         let new_total_bps = entry.total_bps.saturating_add(added_bps);
         entry.holder_count = new_holder_count;
         entry.total_bps = new_total_bps;
@@ -2487,7 +2473,7 @@ impl RevoraRevenueShare {
 
         env.events().publish(
             (EVENT_SNAP_SHARES_APPLIED, issuer, namespace, token),
-            (snapshot_ref, start_index, batch_len as u32, new_total_bps),
+            (snapshot_ref, start_index, batch_len, new_total_bps),
         );
         Ok(())
     }
@@ -4317,6 +4303,7 @@ mod vesting_test;
 #[cfg(test)]
 mod test_utils;
 
+#[cfg(test)]
 mod chunking_tests;
 mod test;
 mod test_auth;
