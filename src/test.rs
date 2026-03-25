@@ -1872,7 +1872,10 @@ fn blacklist_overrides_whitelist() {
     let issuer = admin.clone();
 
     let token = Address::generate(&env);
+    let payout_asset = Address::generate(&env);
     let investor = Address::generate(&env);
+
+    client.register_offering(&issuer, &symbol_short!("def"), &token, &1_000, &payout_asset, &0);
 
     // Add to both whitelist and blacklist
     client.whitelist_add(&admin, &issuer, &symbol_short!("def"), &token, &investor);
@@ -5324,47 +5327,34 @@ fn pause_unpause_idempotence_and_events() {
 }
 
 #[test]
-#[should_panic(expected = "contract is paused")]
 fn register_blocked_while_paused() {
     let env = Env::default();
     env.mock_all_auths();
     let client = make_client(&env);
     let admin = Address::generate(&env);
     let issuer = admin.clone();
-
     let token = Address::generate(&env);
     let payout_asset = Address::generate(&env);
-
     client.initialize(&admin, &None::<Address>, &None::<bool>);
     client.pause_admin(&admin);
-    client.register_offering(&issuer, &symbol_short!("def"), &token, &1_000, &payout_asset, &0);
+    let res = client.try_register_offering(&issuer, &symbol_short!("def"), &token, &1_000, &payout_asset, &0);
+    assert!(res.is_err());
 }
 
 #[test]
-#[should_panic(expected = "contract is paused")]
 fn report_blocked_while_paused() {
     let env = Env::default();
     env.mock_all_auths();
     let client = make_client(&env);
     let admin = Address::generate(&env);
     let issuer = admin.clone();
-
     let token = Address::generate(&env);
     let payout_asset = Address::generate(&env);
-
     client.initialize(&admin, &None::<Address>, &None::<bool>);
-    // Register before pausing
     client.register_offering(&issuer, &symbol_short!("def"), &token, &1_000, &payout_asset, &0);
     client.pause_admin(&admin);
-    client.report_revenue(
-        &issuer,
-        &symbol_short!("def"),
-        &token,
-        &payout_asset,
-        &1_000_000,
-        &1,
-        &false,
-    );
+    let res = client.try_report_revenue(&issuer, &symbol_short!("def"), &token, &payout_asset, &1_000_000, &1, &false);
+    assert!(res.is_err());
 }
 
 #[test]
@@ -5391,7 +5381,6 @@ fn pause_safety_role_works() {
 }
 
 #[test]
-#[should_panic(expected = "contract is paused")]
 fn blacklist_add_blocked_while_paused() {
     let env = Env::default();
     env.mock_all_auths();
@@ -5407,11 +5396,11 @@ fn blacklist_add_blocked_while_paused() {
 
     client.initialize(&admin, &None::<Address>, &None::<bool>);
     client.pause_admin(&admin);
-    client.blacklist_add(&admin, &issuer, &symbol_short!("def"), &token, &investor);
+    let res = client.try_blacklist_add(&admin, &issuer, &symbol_short!("def"), &token, &investor);
+    assert!(res.is_err());
 }
 
 #[test]
-#[should_panic(expected = "contract is paused")]
 fn blacklist_remove_blocked_while_paused() {
     let env = Env::default();
     env.mock_all_auths();
@@ -5427,7 +5416,8 @@ fn blacklist_remove_blocked_while_paused() {
 
     client.initialize(&admin, &None::<Address>, &None::<bool>);
     client.pause_admin(&admin);
-    client.blacklist_remove(&admin, &issuer, &symbol_short!("def"), &token, &investor);
+    let res = client.try_blacklist_remove(&admin, &issuer, &symbol_short!("def"), &token, &investor);
+    assert!(res.is_err());
 }
 #[test]
 fn large_period_range_sums_correctly_full() {

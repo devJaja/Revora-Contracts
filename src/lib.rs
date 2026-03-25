@@ -73,6 +73,8 @@ pub enum RevoraError {
     SignatureReplay = 28,
     /// Off-chain signer key has not been registered.
     SignerKeyNotRegistered = 29,
+    /// Contract is paused; state-changing operations are disabled.
+    ContractPaused = 30,
 }
 
 // ── Event symbols ────────────────────────────────────────────
@@ -900,11 +902,12 @@ impl RevoraRevenueShare {
         env.storage().persistent().get::<DataKey, bool>(&DataKey::Paused).unwrap_or(false)
     }
 
-    /// Helper: panic if contract is paused. Used by state-mutating entrypoints.
-    fn require_not_paused(env: &Env) {
+    /// Helper: return error if contract is paused. Used by state-mutating entrypoints.
+    fn require_not_paused(env: &Env) -> Result<(), RevoraError> {
         if env.storage().persistent().get::<DataKey, bool>(&DataKey::Paused).unwrap_or(false) {
-            panic!("contract is paused");
+            return Err(RevoraError::ContractPaused);
         }
+        Ok(())
     }
 
     // ── Offering management ───────────────────────────────────
@@ -937,7 +940,7 @@ impl RevoraRevenueShare {
         supply_cap: i128,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
-        Self::require_not_paused(&env);
+        Self::require_not_paused(&env)?;
         issuer.require_auth();
 
         // Skip bps validation in testnet mode
@@ -1096,7 +1099,7 @@ impl RevoraRevenueShare {
         override_existing: bool,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
-        Self::require_not_paused(&env);
+        Self::require_not_paused(&env)?;
         issuer.require_auth();
 
         let event_only = Self::is_event_only(&env);
@@ -1319,16 +1322,6 @@ impl RevoraRevenueShare {
             (payout_asset.clone(), amount, period_id),
         );
 
-        // Audit log summary (#34): maintain per-offering total revenue and report count
-        let summary_key = DataKey::AuditSummary(offering_id.clone());
-        let mut summary: AuditSummary = env
-            .storage()
-            .persistent()
-            .get(&summary_key)
-            .unwrap_or(AuditSummary { total_revenue: 0, report_count: 0 });
-        summary.total_revenue = summary.total_revenue.saturating_add(amount);
-        summary.report_count = summary.report_count.saturating_add(1);
-        env.storage().persistent().set(&summary_key, &summary);
         // Optionally emit versioned v1 events for forward-compatible consumers
         if Self::is_event_versioning_enabled(env.clone()) {
             env.events().publish(
@@ -1502,7 +1495,7 @@ impl RevoraRevenueShare {
         investor: Address,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
-        Self::require_not_paused(&env);
+        Self::require_not_paused(&env)?;
         caller.require_auth();
 
         let offering_id = OfferingId {
@@ -1510,24 +1503,6 @@ impl RevoraRevenueShare {
             namespace: namespace.clone(),
             token: token.clone(),
         };
-
-        if !Self::is_event_only(&env) {
-            let key = DataKey::Blacklist(offering_id.clone());
-            let mut map: Map<Address, bool> =
-                env.storage().persistent().get(&key).unwrap_or_else(|| Map::new(&env));
-
-            map.set(investor.clone(), true);
-            env.storage().persistent().set(&key, &map);
-        }
-        // Verify auth: caller must be issuer or admin
-        let current_issuer =
-            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
-                .ok_or(RevoraError::OfferingNotFound)?;
-        let admin = Self::get_admin(env.clone()).ok_or(RevoraError::NotInitialized)?;
-
-        if caller != current_issuer && caller != admin {
-            return Err(RevoraError::NotAuthorized);
-        }
 
         let key = DataKey::Blacklist(offering_id.clone());
         let mut map: Map<Address, bool> =
@@ -1572,7 +1547,7 @@ impl RevoraRevenueShare {
         investor: Address,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
-        Self::require_not_paused(&env);
+        Self::require_not_paused(&env)?;
         caller.require_auth();
 
         let offering_id = OfferingId {
@@ -1581,34 +1556,24 @@ impl RevoraRevenueShare {
             token: token.clone(),
         };
 
-        let current_issuer =
-            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
-                .ok_or(RevoraError::OfferingNotFound)?;
-        let admin = Self::get_admin(env.clone()).ok_or(RevoraError::NotInitialized)?;
-        if caller != current_issuer && caller != admin {
-            return Err(RevoraError::NotAuthorized);
-        }
+        let key = DataKey::Blacklist(offering_id.clone());
+        let mut map: Map<Address, bool> =
+            env.storage().persistent().get(&key).unwrap_or_else(|| Map::new(&env));
+        map.remove(investor.clone());
+        env.storage().persistent().set(&key, &map);
 
-        if !Self::is_event_only(&env) {
-            let key = DataKey::Blacklist(offering_id.clone());
-            let mut map: Map<Address, bool> =
-                env.storage().persistent().get(&key).unwrap_or_else(|| Map::new(&env));
-            map.remove(investor.clone());
-            env.storage().persistent().set(&key, &map);
-
-            // Rebuild order vec so get_blacklist stays deterministic (#38)
-            let order_key = DataKey::BlacklistOrder(offering_id.clone());
-            let old_order: Vec<Address> =
-                env.storage().persistent().get(&order_key).unwrap_or_else(|| Vec::new(&env));
-            let mut new_order = Vec::new(&env);
-            for i in 0..old_order.len() {
-                let addr = old_order.get(i).unwrap();
-                if map.get(addr.clone()).unwrap_or(false) {
-                    new_order.push_back(addr);
-                }
+        // Rebuild order vec so get_blacklist stays deterministic (#38)
+        let order_key = DataKey::BlacklistOrder(offering_id.clone());
+        let old_order: Vec<Address> =
+            env.storage().persistent().get(&order_key).unwrap_or_else(|| Vec::new(&env));
+        let mut new_order = Vec::new(&env);
+        for i in 0..old_order.len() {
+            let addr = old_order.get(i).unwrap();
+            if map.get(addr.clone()).unwrap_or(false) {
+                new_order.push_back(addr);
             }
-            env.storage().persistent().set(&order_key, &new_order);
         }
+        env.storage().persistent().set(&order_key, &new_order);
 
         env.events().publish((EVENT_BL_REM, issuer, namespace, token), (caller, investor));
         Ok(())
@@ -2305,7 +2270,7 @@ impl RevoraRevenueShare {
         content_hash: BytesN<32>,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
-        Self::require_not_paused(&env);
+        Self::require_not_paused(&env)?;
         issuer.require_auth();
 
         // Verify offering exists and caller is current issuer.
@@ -2398,7 +2363,7 @@ impl RevoraRevenueShare {
         holders: Vec<(Address, u32)>,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
-        Self::require_not_paused(&env);
+        Self::require_not_paused(&env)?;
         issuer.require_auth();
 
         let current_issuer =
@@ -2634,7 +2599,7 @@ impl RevoraRevenueShare {
         signature: BytesN<64>,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
-        Self::require_not_paused(&env);
+        Self::require_not_paused(&env)?;
         let current_issuer = Self::get_current_issuer(
             &env,
             payload.issuer.clone(),
@@ -2693,7 +2658,7 @@ impl RevoraRevenueShare {
         signature: BytesN<64>,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
-        Self::require_not_paused(&env);
+        Self::require_not_paused(&env)?;
         let current_issuer = Self::get_current_issuer(
             &env,
             payload.issuer.clone(),
@@ -3984,7 +3949,7 @@ impl RevoraRevenueShare {
         metadata: String,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
-        Self::require_not_paused(&env);
+        Self::require_not_paused(&env)?;
 
         // Verify offering exists and issuer is current
         let offering_id = OfferingId {
