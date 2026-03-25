@@ -112,6 +112,8 @@ const EVENT_SCHEMA_VERSION: u32 = 1;
 const EVENT_CONCENTRATION_WARNING: Symbol = symbol_short!("conc_warn");
 const EVENT_REV_DEPOSIT: Symbol = symbol_short!("rev_dep");
 const EVENT_REV_DEP_SNAP: Symbol = symbol_short!("rev_snap");
+const EVENT_SNAP_COMMIT: Symbol = symbol_short!("snap_com");
+const EVENT_SNAP_SHARES_APPLIED: Symbol = symbol_short!("snap_shr");
 const EVENT_CLAIM: Symbol = symbol_short!("claim");
 const EVENT_SHARE_SET: Symbol = symbol_short!("share_set");
 const EVENT_FREEZE: Symbol = symbol_short!("freeze");
@@ -361,6 +363,35 @@ pub enum RoundingMode {
     RoundHalfUp = 1,
 }
 
+/// Immutable record of a committed snapshot for an offering.
+///
+/// A snapshot captures the canonical state of holder shares at a specific point in time,
+/// identified by a monotonically increasing `snapshot_ref`. Once committed, the entry
+/// is write-once: subsequent calls with the same `snapshot_ref` are rejected.
+///
+/// The `content_hash` field is a 32-byte SHA-256 (or equivalent) digest of the off-chain
+/// holder-share dataset. It is provided by the issuer and stored verbatim; the contract
+/// does not recompute it. Integrators MUST verify the hash off-chain before trusting
+/// the snapshot data.
+///
+/// Security assumption: the issuer is trusted to supply a correct `content_hash`.
+/// The contract enforces monotonicity and write-once semantics; it does NOT verify
+/// that `content_hash` matches the on-chain holder entries written by `apply_snapshot_shares`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SnapshotEntry {
+    /// Monotonically increasing snapshot identifier (must be > previous snapshot_ref).
+    pub snapshot_ref: u64,
+    /// Ledger timestamp at commit time (set by the contract, not the caller).
+    pub committed_at: u64,
+    /// Off-chain content hash of the holder-share dataset (32 bytes, caller-supplied).
+    pub content_hash: BytesN<32>,
+    /// Total number of holder entries recorded in this snapshot.
+    pub holder_count: u32,
+    /// Total basis points across all holders (informational; not enforced on-chain).
+    pub total_bps: u32,
+}
+
 /// Storage keys: offerings use OfferCount/OfferItem; blacklist uses Blacklist(token).
 /// Multi-period claim keys use PeriodRevenue/PeriodEntry/PeriodCount for per-offering
 /// period tracking, HolderShare for holder allocations, LastClaimedIdx for claim progress,
@@ -421,6 +452,13 @@ pub enum DataKey {
     SnapshotConfig(OfferingId),
     /// Latest recorded snapshot reference for an offering.
     LastSnapshotRef(OfferingId),
+    /// Committed snapshot entry keyed by (offering_id, snapshot_ref).
+    /// Stores the canonical SnapshotEntry for deterministic replay and audit.
+    SnapshotEntry(OfferingId, u64),
+    /// Per-snapshot holder share at index N: (offering_id, snapshot_ref, index) -> (holder, share_bps).
+    SnapshotHolder(OfferingId, u64, u32),
+    /// Total number of holders recorded in a snapshot: (offering_id, snapshot_ref) -> u32.
+    SnapshotHolderCount(OfferingId, u64),
 
     /// Pending issuer transfer for an offering: OfferingId -> new_issuer.
     PendingIssuerTransfer(OfferingId),
@@ -2201,7 +2239,293 @@ impl RevoraRevenueShare {
         env.storage().persistent().get(&key).unwrap_or(0)
     }
 
-    /// Set a holder's revenue share (in basis points) for an offering.
+    // ── Deterministic Snapshot Expansion (#054) ──────────────────────────────
+    //
+    // Design:
+    //   A "snapshot" is an immutable, write-once record that captures the
+    //   canonical holder-share distribution at a specific point in time.
+    //
+    //   Workflow:
+    //     1. Issuer calls `commit_snapshot` with a strictly-increasing `snapshot_ref`
+    //        and a 32-byte `content_hash` of the off-chain holder dataset.
+    //        The contract stores a `SnapshotEntry` and emits `snap_com`.
+    //     2. Issuer calls `apply_snapshot_shares` (one or more times) to write
+    //        holder shares for this snapshot into persistent storage.
+    //        Each call appends a bounded batch of (holder, share_bps) pairs.
+    //        Emits `snap_shr` per batch.
+    //     3. Issuer calls `deposit_revenue_with_snapshot` (existing) to deposit
+    //        revenue tied to this snapshot_ref.
+    //
+    //   Security assumptions:
+    //   - `content_hash` is caller-supplied and stored verbatim. The contract
+    //     does NOT verify it matches the on-chain holder entries. Off-chain
+    //     consumers MUST recompute and compare the hash.
+    //   - Snapshot refs are strictly monotonic per offering; replay is impossible.
+    //   - `apply_snapshot_shares` is idempotent per (snapshot_ref, index): writing
+    //     the same index twice overwrites with the same value (no double-credit).
+    //   - Only the current offering issuer may commit or apply snapshots.
+    //   - Frozen/paused contract blocks all snapshot writes.
+
+    /// Maximum holders per `apply_snapshot_shares` batch.
+    /// Keeps per-call compute bounded within Soroban limits.
+    const MAX_SNAPSHOT_BATCH: u32 = 50;
+
+    /// Commit a new snapshot entry for an offering.
+    ///
+    /// Records an immutable `SnapshotEntry` keyed by `(offering_id, snapshot_ref)`.
+    /// `snapshot_ref` must be strictly greater than the last committed ref for this
+    /// offering (monotonicity invariant). The `content_hash` is a 32-byte digest of
+    /// the off-chain holder-share dataset; it is stored verbatim and not verified
+    /// on-chain.
+    ///
+    /// ### Auth
+    /// Requires `issuer.require_auth()`. Only the current offering issuer may commit.
+    ///
+    /// ### Errors
+    /// - `OfferingNotFound`: offering does not exist or caller is not current issuer.
+    /// - `SnapshotNotEnabled`: snapshot distribution is not enabled for this offering.
+    /// - `OutdatedSnapshot`: `snapshot_ref` ≤ last committed ref (replay / stale).
+    /// - `ContractFrozen` / paused: contract is not operational.
+    ///
+    /// ### Events
+    /// Emits `snap_com` with `(issuer, namespace, token)` topics and
+    /// `(snapshot_ref, content_hash, committed_at)` data.
+    pub fn commit_snapshot(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        snapshot_ref: u64,
+        content_hash: BytesN<32>,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        Self::require_not_paused(&env);
+        issuer.require_auth();
+
+        // Verify offering exists and caller is current issuer.
+        let current_issuer =
+            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+        if current_issuer != issuer {
+            return Err(RevoraError::OfferingNotFound);
+        }
+
+        // Snapshot distribution must be enabled for this offering.
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+        if !env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::SnapshotConfig(offering_id.clone()))
+            .unwrap_or(false)
+        {
+            return Err(RevoraError::SnapshotNotEnabled);
+        }
+
+        // Enforce strict monotonicity: snapshot_ref must exceed the last committed ref.
+        let last_ref_key = DataKey::LastSnapshotRef(offering_id.clone());
+        let last_ref: u64 = env.storage().persistent().get(&last_ref_key).unwrap_or(0);
+        if snapshot_ref <= last_ref {
+            return Err(RevoraError::OutdatedSnapshot);
+        }
+
+        let committed_at = env.ledger().timestamp();
+        let entry = SnapshotEntry {
+            snapshot_ref,
+            committed_at,
+            content_hash: content_hash.clone(),
+            holder_count: 0,
+            total_bps: 0,
+        };
+
+        // Write-once: store the entry and advance the last-ref pointer atomically.
+        env.storage()
+            .persistent()
+            .set(&DataKey::SnapshotEntry(offering_id.clone(), snapshot_ref), &entry);
+        env.storage().persistent().set(&last_ref_key, &snapshot_ref);
+
+        env.events().publish(
+            (EVENT_SNAP_COMMIT, issuer, namespace, token),
+            (snapshot_ref, content_hash, committed_at),
+        );
+        Ok(())
+    }
+
+    /// Retrieve a committed snapshot entry.
+    ///
+    /// Returns `None` if no snapshot with `snapshot_ref` has been committed for this offering.
+    pub fn get_snapshot_entry(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        snapshot_ref: u64,
+    ) -> Option<SnapshotEntry> {
+        let offering_id = OfferingId { issuer, namespace, token };
+        env.storage()
+            .persistent()
+            .get(&DataKey::SnapshotEntry(offering_id, snapshot_ref))
+    }
+
+    /// Apply a batch of holder shares for a committed snapshot.
+    ///
+    /// Writes `(holder, share_bps)` pairs into persistent storage indexed by
+    /// `(offering_id, snapshot_ref, sequential_index)`. Also updates the live
+    /// `HolderShare` for each holder so they can claim revenue deposited against
+    /// this snapshot.
+    ///
+    /// Batches are bounded by `MAX_SNAPSHOT_BATCH` (50) per call. Callers must
+    /// iterate with increasing `start_index` until all holders are written.
+    ///
+    /// The `SnapshotEntry.holder_count` and `total_bps` fields are updated
+    /// atomically after each batch to reflect the cumulative state.
+    ///
+    /// ### Idempotency
+    /// Re-writing the same `(snapshot_ref, start_index + i)` slot overwrites with
+    /// the same value. Callers should not re-apply batches unless correcting an error
+    /// before the snapshot is used for a deposit.
+    ///
+    /// ### Auth
+    /// Requires `issuer.require_auth()`. Only the current offering issuer may apply.
+    ///
+    /// ### Errors
+    /// - `OfferingNotFound`: offering does not exist or caller is not current issuer.
+    /// - `SnapshotNotEnabled`: snapshot distribution is not enabled.
+    /// - `OutdatedSnapshot`: `snapshot_ref` does not match a committed entry.
+    /// - `LimitReached`: `holders` slice exceeds `MAX_SNAPSHOT_BATCH`.
+    /// - `InvalidShareBps`: any `share_bps` > 10000.
+    /// - `ContractFrozen` / paused: contract is not operational.
+    ///
+    /// ### Events
+    /// Emits `snap_shr` with `(issuer, namespace, token)` topics and
+    /// `(snapshot_ref, start_index, batch_len, new_total_bps)` data.
+    pub fn apply_snapshot_shares(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        snapshot_ref: u64,
+        start_index: u32,
+        holders: Vec<(Address, u32)>,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        Self::require_not_paused(&env);
+        issuer.require_auth();
+
+        let current_issuer =
+            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+        if current_issuer != issuer {
+            return Err(RevoraError::OfferingNotFound);
+        }
+
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+
+        if !env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::SnapshotConfig(offering_id.clone()))
+            .unwrap_or(false)
+        {
+            return Err(RevoraError::SnapshotNotEnabled);
+        }
+
+        // Snapshot must have been committed first.
+        let entry_key = DataKey::SnapshotEntry(offering_id.clone(), snapshot_ref);
+        let mut entry: SnapshotEntry = env
+            .storage()
+            .persistent()
+            .get(&entry_key)
+            .ok_or(RevoraError::OutdatedSnapshot)?;
+
+        let batch_len = holders.len();
+        if batch_len > Self::MAX_SNAPSHOT_BATCH {
+            return Err(RevoraError::LimitReached);
+        }
+
+        // Validate all share_bps before writing anything (fail-fast).
+        for i in 0..batch_len {
+            let (_, share_bps) = holders.get(i).unwrap();
+            if share_bps > 10_000 {
+                return Err(RevoraError::InvalidShareBps);
+            }
+        }
+
+        let mut added_bps: u32 = 0;
+        for i in 0..batch_len {
+            let (holder, share_bps) = holders.get(i).unwrap();
+            let slot = start_index.saturating_add(i as u32);
+
+            // Write indexed slot for deterministic enumeration.
+            env.storage().persistent().set(
+                &DataKey::SnapshotHolder(offering_id.clone(), snapshot_ref, slot),
+                &(holder.clone(), share_bps),
+            );
+
+            // Update live holder share so claim() works immediately.
+            env.storage().persistent().set(
+                &DataKey::HolderShare(offering_id.clone(), holder),
+                &share_bps,
+            );
+
+            added_bps = added_bps.saturating_add(share_bps);
+        }
+
+        // Update snapshot metadata.
+        let new_holder_count = entry.holder_count.saturating_add(batch_len as u32);
+        let new_total_bps = entry.total_bps.saturating_add(added_bps);
+        entry.holder_count = new_holder_count;
+        entry.total_bps = new_total_bps;
+        env.storage().persistent().set(&entry_key, &entry);
+
+        env.events().publish(
+            (EVENT_SNAP_SHARES_APPLIED, issuer, namespace, token),
+            (snapshot_ref, start_index, batch_len as u32, new_total_bps),
+        );
+        Ok(())
+    }
+
+    /// Return the total number of holder entries recorded for a snapshot.
+    ///
+    /// Returns 0 if the snapshot has not been committed or no shares have been applied.
+    pub fn get_snapshot_holder_count(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        snapshot_ref: u64,
+    ) -> u32 {
+        let offering_id = OfferingId { issuer, namespace, token };
+        env.storage()
+            .persistent()
+            .get::<DataKey, SnapshotEntry>(&DataKey::SnapshotEntry(offering_id, snapshot_ref))
+            .map(|e| e.holder_count)
+            .unwrap_or(0)
+    }
+
+    /// Read a single holder entry from a committed snapshot by its sequential index.
+    ///
+    /// Returns `None` if the slot has not been written.
+    pub fn get_snapshot_holder_at(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        snapshot_ref: u64,
+        index: u32,
+    ) -> Option<(Address, u32)> {
+        let offering_id = OfferingId { issuer, namespace, token };
+        env.storage()
+            .persistent()
+            .get(&DataKey::SnapshotHolder(offering_id, snapshot_ref, index))
+    }
     ///
     /// The share determines the percentage of a period's revenue the holder can claim.
     ///
