@@ -73,6 +73,15 @@ pub enum RevoraError {
     SignatureReplay = 28,
     /// Off-chain signer key has not been registered.
     SignerKeyNotRegistered = 29,
+    // ── Admin Rotation Safety Flow (#191) ─────────────────────────────────────
+    /// A rotation is already pending for this admin slot; cancel first.
+    AdminRotationPending = 30,
+    /// No rotation is pending; accept or cancel cannot proceed.
+    NoAdminRotationPending = 31,
+    /// Caller is not the proposed new admin and cannot accept.
+    UnauthorizedRotationAccept = 32,
+    /// Proposed new admin is the same as the current admin; rotation is a no-op.
+    AdminRotationSameAddress = 33,
 }
 
 // ── Event symbols ────────────────────────────────────────────
@@ -407,6 +416,8 @@ pub enum DataKey {
     Admin,
     /// Contract frozen flag; when true, state-changing ops are disabled (#32).
     Frozen,
+    /// Proposed new admin address (pending two-step rotation).
+    PendingAdmin,
 
     /// Multisig admin threshold.
     MultisigThreshold,
@@ -3029,6 +3040,106 @@ impl RevoraRevenueShare {
     pub fn get_admin(env: Env) -> Option<Address> {
         let key = DataKey::Admin;
         env.storage().persistent().get(&key)
+    }
+
+    // ── Admin rotation safety flow (Issue #191) ───────────────
+
+    pub fn propose_admin_rotation(
+        env: Env,
+        new_admin: Address,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .ok_or(RevoraError::NotInitialized)?;
+
+        admin.require_auth();
+
+        if new_admin == admin {
+            return Err(RevoraError::AdminRotationSameAddress);
+        }
+
+        if env.storage().persistent().has(&DataKey::PendingAdmin) {
+            return Err(RevoraError::AdminRotationPending);
+        }
+
+        env.storage().persistent().set(&DataKey::PendingAdmin, &new_admin);
+
+        env.events().publish(
+            (symbol_short!("adm_prop"), admin),
+            new_admin,
+        );
+
+        Ok(())
+    }
+
+    pub fn accept_admin_rotation(
+        env: Env,
+        new_admin: Address,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+
+        let pending: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(RevoraError::NoAdminRotationPending)?;
+
+        if new_admin != pending {
+            return Err(RevoraError::UnauthorizedRotationAccept);
+        }
+
+        new_admin.require_auth();
+
+        let old_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .ok_or(RevoraError::NotInitialized)?;
+
+        env.storage().persistent().set(&DataKey::Admin, &new_admin);
+        env.storage().persistent().remove(&DataKey::PendingAdmin);
+
+        env.events().publish(
+            (symbol_short!("adm_acc"), old_admin),
+            new_admin,
+        );
+
+        Ok(())
+    }
+
+    pub fn cancel_admin_rotation(env: Env) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .ok_or(RevoraError::NotInitialized)?;
+
+        admin.require_auth();
+
+        let pending: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(RevoraError::NoAdminRotationPending)?;
+
+        env.storage().persistent().remove(&DataKey::PendingAdmin);
+
+        env.events().publish(
+            (symbol_short!("adm_canc"), admin),
+            pending,
+        );
+
+        Ok(())
+    }
+
+    pub fn get_pending_admin_rotation(env: Env) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::PendingAdmin)
     }
 
     /// Freeze the contract: no further state-changing operations allowed. Only admin may call.
