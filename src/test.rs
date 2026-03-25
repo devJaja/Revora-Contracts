@@ -14,7 +14,7 @@ use soroban_sdk::{
 
 // ── helper ────────────────────────────────────────────────────
 
-fn make_client(env: &Env) -> RevoraRevenueShareClient<'_> {
+fn make_client(env: &Env) -> RevoraRevenueShareClient {
     let id = env.register_contract(None, RevoraRevenueShare);
     RevoraRevenueShareClient::new(env, &id)
 }
@@ -8157,3 +8157,87 @@ mod scenarios {
         // Verify removed
         assert_eq!(client.get_pending_issuer_transfer(&issuer, &ns, &token), None);
     }
+
+    #[test]
+    fn test_revenue_range_chunk_success_path() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = make_client(&env);
+
+        let issuer = Address::generate(&env);
+        let ns = symbol_short!("def");
+        let token = Address::generate(&env);
+        client.register_offering(&issuer, &ns, &token, &1000, &token, &0);
+
+        // Report 100 revenue for periods 1 to 10
+        for p in 1..=10 {
+            client.report_revenue(&issuer, &ns, &token, &token, &100, &p, &false);
+        }
+
+        // Chunk 1: first 4 periods (1, 2, 3, 4) -> sum 400, next 5
+        let (sum1, next1) = client.get_revenue_range_chunk(&issuer, &ns, &token, &1u64, &10u64, &4u32);
+        assert_eq!(sum1, 400);
+        assert_eq!(next1, Some(5));
+
+        // Chunk 2: next 4 periods (5, 6, 7, 8) -> sum 400, next 9
+        let (sum2, next2) = client.get_revenue_range_chunk(&issuer, &ns, &token, &5u64, &10u64, &4u32);
+        assert_eq!(sum2, 400);
+        assert_eq!(next2, Some(9));
+
+        // Chunk 3: last 2 periods (9, 10) -> sum 200, next None
+        let (sum3, next3) = client.get_revenue_range_chunk(&issuer, &ns, &token, &9u64, &10u64, &4u32);
+        assert_eq!(sum3, 200);
+        assert_eq!(next3, None);
+    }
+
+    #[test]
+    fn test_revenue_range_chunk_invalid_range() {
+        let env = Env::default();
+        let client = make_client(&env);
+        let issuer = Address::generate(&env);
+        let ns = symbol_short!("def");
+        let token = Address::generate(&env);
+
+        // from > to
+        let (sum, next) = client.get_revenue_range_chunk(&issuer, &ns, &token, &10u64, &1u64, &10u32);
+        assert_eq!(sum, 0);
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn test_revenue_range_chunk_capping() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = make_client(&env);
+        let issuer = Address::generate(&env);
+        let ns = symbol_short!("def");
+        let token = Address::generate(&env);
+        client.register_offering(&issuer, &ns, &token, &1000, &token, &0);
+
+        // Report for periods 1..5
+        for p in 1..=5 {
+            client.report_revenue(&issuer, &ns, &token, &token, &100, &p, &false);
+        }
+
+        // Request max_periods = 0 (should cap to MAX_CHUNK_PERIODS = 200)
+        let (sum, next) = client.get_revenue_range_chunk(&issuer, &ns, &token, &1u64, &300u64, &0u32);
+        // It should process 200 periods (1 to 200)
+        // 1..5 have 100 each, 6..200 have 0. Sum = 500.
+        assert_eq!(sum, 500);
+        assert_eq!(next, Some(201));
+    }
+
+    #[test]
+    fn test_revenue_range_chunk_empty_offering() {
+        let env = Env::default();
+        let client = make_client(&env);
+        let unknown_issuer = Address::generate(&env);
+        let ns = symbol_short!("def");
+        let token = Address::generate(&env);
+
+        // Should just return 0 sum since no revenue exists
+        let (sum, next) = client.get_revenue_range_chunk(&unknown_issuer, &ns, &token, &1u64, &10u64, &10u32);
+        assert_eq!(sum, 0);
+        assert_eq!(next, None);
+    }
+}

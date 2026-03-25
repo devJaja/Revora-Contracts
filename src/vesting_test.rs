@@ -5,7 +5,7 @@ use soroban_sdk::{
 
 use crate::vesting::{RevoraVesting, RevoraVestingClient};
 
-fn setup(env: &Env) -> (RevoraVestingClient<'_>, Address, Address, Address) {
+fn setup(env: &Env) -> (RevoraVestingClient, Address, Address, Address) {
     let contract_id = env.register_contract(None, RevoraVesting);
     let client = RevoraVestingClient::new(env, &contract_id);
     let admin = Address::generate(env);
