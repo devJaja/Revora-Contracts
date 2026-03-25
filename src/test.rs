@@ -4528,12 +4528,13 @@ fn multisig_duplicate_approval_is_idempotent() {
     let (_env, client, owner1, _owner2, _owner3, _caller) = multisig_setup();
 
     let proposal_id = client.propose_action(&owner1, &ProposalAction::Freeze);
-    // owner1 already approved (auto-approval from propose)
-    // Approving again should be a no-op (not an error, not a duplicate entry)
-    client.approve_action(&owner1, &proposal_id);
+    // owner1 already approved (auto-approval from propose).
+    // A second approval by the same owner must be rejected with AlreadyApproved.
+    let r = client.try_approve_action(&owner1, &proposal_id);
+    assert_eq!(r, Err(Ok(RevoraError::AlreadyApproved)));
 
+    // Approval list must remain a set — still exactly 1 entry.
     let proposal = client.get_proposal(&proposal_id).unwrap();
-    // Still only 1 approval (no duplicate)
     assert_eq!(proposal.approvals.len(), 1);
 }
 
@@ -4763,6 +4764,136 @@ fn multisig_multiple_proposals_independent() {
 fn multisig_get_proposal_nonexistent_returns_none() {
     let (_env, client, _owner1, _owner2, _owner3, _caller) = multisig_setup();
     assert!(client.get_proposal(&9999).is_none());
+}
+
+// ── Duplicate-approval guard tests ────────────────────────────────────────────
+//
+// Security assumption: the approval list is a set — each owner address appears
+// at most once. Threshold enforcement counts list length, so any inflation of
+// that count would allow a single owner to satisfy an N-of-M threshold alone.
+// These tests validate every path through the guard.
+
+/// Proposer's auto-approval is counted; a second call by the proposer returns
+/// AlreadyApproved and does NOT add a second entry.
+#[test]
+fn multisig_duplicate_approval_proposer_returns_already_approved() {
+    let (_env, client, owner1, _owner2, _owner3, _caller) = multisig_setup();
+
+    let pid = client.propose_action(&owner1, &ProposalAction::Freeze);
+    let r = client.try_approve_action(&owner1, &pid);
+    assert_eq!(r, Err(Ok(RevoraError::AlreadyApproved)));
+
+    let proposal = client.get_proposal(&pid).unwrap();
+    assert_eq!(proposal.approvals.len(), 1);
+}
+
+/// A non-proposer owner who approves once cannot approve a second time.
+#[test]
+fn multisig_duplicate_approval_second_owner_returns_already_approved() {
+    let (_env, client, owner1, owner2, _owner3, _caller) = multisig_setup();
+
+    let pid = client.propose_action(&owner1, &ProposalAction::Freeze);
+    client.approve_action(&owner2, &pid); // first approval by owner2 — ok
+    let r = client.try_approve_action(&owner2, &pid); // second — must fail
+    assert_eq!(r, Err(Ok(RevoraError::AlreadyApproved)));
+
+    let proposal = client.get_proposal(&pid).unwrap();
+    // owner1 (auto) + owner2 = 2, no duplicates
+    assert_eq!(proposal.approvals.len(), 2);
+}
+
+/// All three owners approve once each; no duplicates; count reaches 3.
+#[test]
+fn multisig_duplicate_approval_all_owners_approve_once_each() {
+    let (_env, client, owner1, owner2, owner3, _caller) = multisig_setup();
+
+    let pid = client.propose_action(&owner1, &ProposalAction::Freeze);
+    client.approve_action(&owner2, &pid);
+    client.approve_action(&owner3, &pid);
+
+    let proposal = client.get_proposal(&pid).unwrap();
+    assert_eq!(proposal.approvals.len(), 3);
+    // Each owner appears exactly once
+    assert_eq!(proposal.approvals.get(0).unwrap(), owner1);
+    assert_eq!(proposal.approvals.get(1).unwrap(), owner2);
+    assert_eq!(proposal.approvals.get(2).unwrap(), owner3);
+}
+
+/// Duplicate approval does NOT emit a prop_app event (no side-effects on failure).
+#[test]
+fn multisig_duplicate_approval_emits_no_event_on_rejection() {
+    let (env, client, owner1, _owner2, _owner3, _caller) = multisig_setup();
+
+    let pid = client.propose_action(&owner1, &ProposalAction::Freeze);
+    let before = env.events().all().len();
+    let _ = client.try_approve_action(&owner1, &pid); // duplicate — must fail
+                                                      // No new events should have been emitted
+    assert_eq!(env.events().all().len(), before);
+}
+
+/// Duplicate approval on an already-executed proposal returns LimitReached
+/// (executed check fires before the duplicate guard).
+#[test]
+fn multisig_duplicate_approval_on_executed_proposal_returns_limit_reached() {
+    let (_env, client, owner1, owner2, _owner3, _caller) = multisig_setup();
+
+    let pid = client.propose_action(&owner1, &ProposalAction::Freeze);
+    client.approve_action(&owner2, &pid);
+    client.execute_action(&pid);
+
+    // owner1 tries to approve again after execution
+    let r = client.try_approve_action(&owner1, &pid);
+    assert_eq!(r, Err(Ok(RevoraError::LimitReached)));
+}
+
+/// A duplicate approval attempt does not advance the approval count and therefore
+/// cannot push a proposal from below-threshold to at-threshold.
+#[test]
+fn multisig_duplicate_approval_cannot_satisfy_threshold() {
+    let (_env, client, owner1, _owner2, _owner3, _caller) = multisig_setup();
+
+    // threshold = 2; only owner1 has approved (auto)
+    let pid = client.propose_action(&owner1, &ProposalAction::Freeze);
+
+    // owner1 tries to double-approve to reach threshold=2 alone
+    let _ = client.try_approve_action(&owner1, &pid);
+
+    // Execution must still fail — threshold not met
+    let r = client.try_execute_action(&pid);
+    assert!(r.is_err());
+    assert!(!client.is_frozen());
+}
+
+/// Duplicate approval on a non-existent proposal returns OfferingNotFound
+/// (proposal lookup fires before the duplicate guard).
+#[test]
+fn multisig_duplicate_approval_nonexistent_proposal_returns_not_found() {
+    let (_env, client, owner1, _owner2, _owner3, _caller) = multisig_setup();
+
+    let r = client.try_approve_action(&owner1, &9999);
+    assert_eq!(r, Err(Ok(RevoraError::OfferingNotFound)));
+}
+
+/// Duplicate approvals across independent proposals do not cross-contaminate.
+#[test]
+fn multisig_duplicate_approval_independent_proposals_isolated() {
+    let (_env, client, owner1, owner2, _owner3, _caller) = multisig_setup();
+
+    let p1 = client.propose_action(&owner1, &ProposalAction::Freeze);
+    let p2 = client.propose_action(&owner1, &ProposalAction::Freeze);
+
+    // owner2 approves p1 — valid
+    client.approve_action(&owner2, &p1);
+    // owner2 approves p2 — also valid (different proposal)
+    client.approve_action(&owner2, &p2);
+
+    // owner2 tries to approve p1 again — must fail
+    let r = client.try_approve_action(&owner2, &p1);
+    assert_eq!(r, Err(Ok(RevoraError::AlreadyApproved)));
+
+    // p2 approval count unaffected
+    let proposal2 = client.get_proposal(&p2).unwrap();
+    assert_eq!(proposal2.approvals.len(), 2);
 }
 
 #[test]
@@ -7816,7 +7947,14 @@ mod claim_after_cancel {
             (pt, a)
         };
         token::StellarAssetClient::new(&env, &payment_token).mint(&issuer, &10_000_000);
-        client.register_offering(&issuer, &symbol_short!("def"), &token, &5_000, &payment_token, &0);
+        client.register_offering(
+            &issuer,
+            &symbol_short!("def"),
+            &token,
+            &5_000,
+            &payment_token,
+            &0,
+        );
         (env, client, issuer, token, payment_token, contract_id)
     }
 
@@ -7950,7 +8088,14 @@ mod claim_after_cancel {
         let holder = Address::generate(&env);
 
         // Deposit revenue before cancellation
-        client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &100_000, &1);
+        client.deposit_revenue(
+            &issuer,
+            &symbol_short!("def"),
+            &token,
+            &payment_token,
+            &100_000,
+            &1,
+        );
         client.set_holder_share(&issuer, &symbol_short!("def"), &token, &holder, &10_000); // 100%
 
         // Cancel the offering
@@ -7968,9 +8113,30 @@ mod claim_after_cancel {
         let (env, client, issuer, token, payment_token, _) = cancel_test_setup();
         let holder = Address::generate(&env);
 
-        client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &100_000, &1);
-        client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &200_000, &2);
-        client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &300_000, &3);
+        client.deposit_revenue(
+            &issuer,
+            &symbol_short!("def"),
+            &token,
+            &payment_token,
+            &100_000,
+            &1,
+        );
+        client.deposit_revenue(
+            &issuer,
+            &symbol_short!("def"),
+            &token,
+            &payment_token,
+            &200_000,
+            &2,
+        );
+        client.deposit_revenue(
+            &issuer,
+            &symbol_short!("def"),
+            &token,
+            &payment_token,
+            &300_000,
+            &3,
+        );
         client.set_holder_share(&issuer, &symbol_short!("def"), &token, &holder, &10_000);
 
         client.cancel_offering(&issuer, &symbol_short!("def"), &token);
@@ -8014,7 +8180,14 @@ mod claim_after_cancel {
         let (env, client, issuer, token, payment_token, _) = cancel_test_setup();
         let holder = Address::generate(&env);
 
-        client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &100_000, &1);
+        client.deposit_revenue(
+            &issuer,
+            &symbol_short!("def"),
+            &token,
+            &payment_token,
+            &100_000,
+            &1,
+        );
         client.set_holder_share(&issuer, &symbol_short!("def"), &token, &holder, &10_000);
         client.cancel_offering(&issuer, &symbol_short!("def"), &token);
 
@@ -8030,7 +8203,14 @@ mod claim_after_cancel {
         let (env, client, issuer, token, payment_token, _) = cancel_test_setup();
         let holder = Address::generate(&env);
 
-        client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &100_000, &1);
+        client.deposit_revenue(
+            &issuer,
+            &symbol_short!("def"),
+            &token,
+            &payment_token,
+            &100_000,
+            &1,
+        );
         client.set_holder_share(&issuer, &symbol_short!("def"), &token, &holder, &10_000);
         client.blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &holder);
         client.cancel_offering(&issuer, &symbol_short!("def"), &token);
@@ -8045,7 +8225,14 @@ mod claim_after_cancel {
         let (env, client, issuer, token, payment_token, _) = cancel_test_setup();
         let holder = Address::generate(&env);
 
-        client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &100_000, &1);
+        client.deposit_revenue(
+            &issuer,
+            &symbol_short!("def"),
+            &token,
+            &payment_token,
+            &100_000,
+            &1,
+        );
         // No set_holder_share call — share is 0
         client.cancel_offering(&issuer, &symbol_short!("def"), &token);
 
@@ -8060,7 +8247,14 @@ mod claim_after_cancel {
         let holder_a = Address::generate(&env);
         let holder_b = Address::generate(&env);
 
-        client.deposit_revenue(&issuer, &symbol_short!("def"), &token, &payment_token, &100_000, &1);
+        client.deposit_revenue(
+            &issuer,
+            &symbol_short!("def"),
+            &token,
+            &payment_token,
+            &100_000,
+            &1,
+        );
         client.set_holder_share(&issuer, &symbol_short!("def"), &token, &holder_a, &6_000); // 60%
         client.set_holder_share(&issuer, &symbol_short!("def"), &token, &holder_b, &4_000); // 40%
         client.cancel_offering(&issuer, &symbol_short!("def"), &token);
@@ -8077,7 +8271,14 @@ mod claim_after_cancel {
         let (env, client, issuer, token_a, payment_token, _) = cancel_test_setup();
         let token_b = Address::generate(&env);
         token::StellarAssetClient::new(&env, &payment_token).mint(&issuer, &10_000_000);
-        client.register_offering(&issuer, &symbol_short!("def"), &token_b, &5_000, &payment_token, &0);
+        client.register_offering(
+            &issuer,
+            &symbol_short!("def"),
+            &token_b,
+            &5_000,
+            &payment_token,
+            &0,
+        );
 
         client.cancel_offering(&issuer, &symbol_short!("def"), &token_a);
 
@@ -8109,7 +8310,14 @@ mod claim_after_cancel {
     fn cancel_is_scoped_per_namespace() {
         let (env, client, issuer, token, payment_token, _) = cancel_test_setup();
         token::StellarAssetClient::new(&env, &payment_token).mint(&issuer, &10_000_000);
-        client.register_offering(&issuer, &symbol_short!("ns2"), &token, &5_000, &payment_token, &0);
+        client.register_offering(
+            &issuer,
+            &symbol_short!("ns2"),
+            &token,
+            &5_000,
+            &payment_token,
+            &0,
+        );
 
         client.cancel_offering(&issuer, &symbol_short!("def"), &token);
 

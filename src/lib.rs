@@ -86,6 +86,19 @@ pub enum RevoraError {
     /// cancellation timestamp; those funds remain in the contract and are
     /// accessible via the normal `claim` flow.
     OfferingCancelled = 31,
+    /// Caller has already approved this proposal.
+    ///
+    /// Raised by `approve_action` when the approver's address is already present
+    /// in the proposal's approval list. This is a hard guard: the call is rejected
+    /// rather than silently ignored, so callers receive explicit feedback and
+    /// off-chain orchestrators can detect double-submission bugs.
+    ///
+    /// # Security note
+    /// Without this guard a buggy or malicious orchestrator could submit the same
+    /// approval multiple times. Because approval count drives threshold enforcement,
+    /// any inflation of the count would allow threshold bypass. The guard ensures
+    /// the approval list is a set (each owner appears at most once).
+    AlreadyApproved = 32,
 }
 
 // ── Event symbols ────────────────────────────────────────────
@@ -2541,10 +2554,8 @@ impl RevoraRevenueShare {
 
         // Claim-after-cancel: read the cancellation timestamp once (None = active offering).
         // Periods deposited after this timestamp are skipped; pre-cancel periods are claimable.
-        let cancelled_at: Option<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::OfferingCancelledAt(offering_id.clone()));
+        let cancelled_at: Option<u64> =
+            env.storage().persistent().get(&DataKey::OfferingCancelledAt(offering_id.clone()));
 
         let mut total_payout: i128 = 0;
         let mut claimed_periods = Vec::new(&env);
@@ -3126,6 +3137,25 @@ impl RevoraRevenueShare {
     }
 
     /// Approve an existing multisig proposal.
+    ///
+    /// # Duplicate-approval guard
+    /// Each owner may approve a proposal at most once. If `approver` is already
+    /// present in `proposal.approvals`, the call returns
+    /// [`RevoraError::AlreadyApproved`] rather than silently succeeding.
+    ///
+    /// **Security rationale:** The approval list is the sole input to threshold
+    /// enforcement. Allowing duplicate entries would inflate the apparent approval
+    /// count and could allow a single owner to satisfy an N-of-M threshold alone.
+    /// The guard is a linear scan over the approval list; because the list is
+    /// bounded by the owner count (itself bounded at init time), the scan is O(M)
+    /// where M is the number of owners — safe for all realistic multisig sizes.
+    ///
+    /// # Errors
+    /// - [`RevoraError::LimitReached`] — multisig not initialized, proposal not
+    ///   found, or proposal already executed.
+    /// - [`RevoraError::AlreadyApproved`] — `approver` has already approved this
+    ///   proposal.
+    /// - Auth panic — `approver` is not a registered multisig owner.
     pub fn approve_action(
         env: Env,
         approver: Address,
@@ -3142,10 +3172,12 @@ impl RevoraRevenueShare {
             return Err(RevoraError::LimitReached);
         }
 
-        // Check for duplicate approvals
+        // Duplicate-approval guard: the approval list must be a set.
+        // A linear scan is safe here because the list length is bounded by the
+        // number of registered owners, which is fixed at init time.
         for i in 0..proposal.approvals.len() {
             if proposal.approvals.get(i).unwrap() == approver {
-                return Ok(()); // Already approved
+                return Err(RevoraError::AlreadyApproved);
             }
         }
 
@@ -4042,10 +4074,7 @@ impl RevoraRevenueShare {
         let cancelled_at = env.ledger().timestamp();
         env.storage().persistent().set(&cancel_key, &cancelled_at);
 
-        env.events().publish(
-            (EVENT_OFFERING_CANCELLED, issuer, namespace, token),
-            cancelled_at,
-        );
+        env.events().publish((EVENT_OFFERING_CANCELLED, issuer, namespace, token), cancelled_at);
         Ok(())
     }
 
