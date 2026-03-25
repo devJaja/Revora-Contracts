@@ -8241,3 +8241,4 @@ mod scenarios {
         assert_eq!(next, None);
     }
 }
+}
