@@ -105,6 +105,39 @@ fn freeze_missing_auth_no_mutation() {
 }
 
 #[test]
+fn freeze_offering_missing_auth_no_mutation() {
+    let env = Env::default();
+    let client = make_client(&env);
+    let (_admin, _safety) = init_admin_safety(&env, &client);
+    let (issuer, token) = setup_offering(&env, &client);
+
+    assert!(client
+        .try_freeze_offering(&Address::generate(&env), &issuer, &symbol_short!("def"), &token)
+        .is_err());
+    assert!(!client.is_offering_frozen(&issuer, &symbol_short!("def"), &token));
+}
+
+#[test]
+fn unfreeze_offering_missing_auth_no_mutation() {
+    let env = Env::default();
+    let client = make_client(&env);
+    let (admin, _safety) = init_admin_safety(&env, &client);
+    let (issuer, token) = setup_offering(&env, &client);
+
+    client.freeze_offering(&issuer, &issuer, &symbol_short!("def"), &token);
+    assert!(client.is_offering_frozen(&issuer, &symbol_short!("def"), &token));
+
+    let attacker = Address::generate(&env);
+    assert!(client
+        .try_unfreeze_offering(&attacker, &issuer, &symbol_short!("def"), &token)
+        .is_err());
+    assert!(client.is_offering_frozen(&issuer, &symbol_short!("def"), &token));
+
+    client.unfreeze_offering(&admin, &issuer, &symbol_short!("def"), &token);
+    assert!(!client.is_offering_frozen(&issuer, &symbol_short!("def"), &token));
+}
+
+#[test]
 fn set_admin_missing_auth() {
     let env = Env::default();
     let client = make_client(&env);
