@@ -4109,6 +4109,10 @@ impl RevoraRevenueShare {
     }
 }
 
+/// Security Assertions Module
+/// Provides production-grade security validation, input validation, and error handling.
+pub mod security_assertions;
+
 pub mod vesting;
 
 #[cfg(test)]
