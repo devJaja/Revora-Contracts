@@ -73,6 +73,8 @@ pub enum RevoraError {
     SignatureReplay = 28,
     /// Off-chain signer key has not been registered.
     SignerKeyNotRegistered = 29,
+    /// Contract is paused; state-changing operations are disabled.
+    ContractPaused = 30,
 }
 
 // ── Event symbols ────────────────────────────────────────────
