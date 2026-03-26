@@ -468,6 +468,11 @@ pub enum DataKey {
     NamespaceCount(Address),
     NamespaceItem(Address, u32),
     NamespaceRegistered(Address, Symbol),
+
+    /// DataKey for testing storage boundaries without affecting business state.
+    StressDataEntry(Address, u32),
+    /// Tracks total amount of dummy data allocated per admin.
+    StressDataCount(Address),
 }
 
 /// Maximum number of offerings returned in a single page.
@@ -3982,6 +3987,117 @@ impl RevoraRevenueShare {
     pub fn get_version(env: Env) -> u32 {
         let _ = env;
         CONTRACT_VERSION
+    }
+
+    /// Automates the insertion of dummy storage records to simulate and stress-test
+    /// maximum platform capacity and gas limits.
+    ///
+    /// # Security Assumptions
+    /// - Restricted to the contract `Admin` via `require_auth()`.
+    /// - Hard limit of 1,000 records per transaction to prevent ledger timeouts and CPU spikes.
+    /// - Data generated is segregated into a dedicated `StressData` namespace (DataKey)
+    ///   so it does not corrupt the platform's production business state.
+    ///
+    /// # Parameters
+    /// - `caller`: Admin address authorizing the action.
+    /// - `record_count`: Number of dummy records to write. Capped at 1,000.
+    /// - `payload_size_bytes`: Size of the byte payload for each record. Capped at 10,000 bytes.
+    pub fn automate_storage_stress(
+        env: Env,
+        caller: Address,
+        record_count: u32,
+        payload_size_bytes: u32,
+    ) -> Result<u32, RevoraError> {
+        Self::require_not_frozen(&env)?;
+        caller.require_auth();
+
+        // Ensure only admin can execute this stress test mechanism
+        let admin: Address = env.storage().persistent().get(&DataKey::Admin).ok_or(RevoraError::NotInitialized)?;
+        if caller != admin {
+            panic!("not admin");
+        }
+
+        // Production-grade guardrails
+        const MAX_RECORDS_PER_TX: u32 = 1000;
+        const MAX_PAYLOAD_SIZE: u32 = 10000;
+
+        if record_count > MAX_RECORDS_PER_TX || payload_size_bytes > MAX_PAYLOAD_SIZE {
+            return Err(RevoraError::LimitReached); // Exceeds safe boundaries
+        }
+
+        // Current count marker to prevent overwriting and allow accumulation
+        let count_key = DataKey::StressDataCount(caller.clone());
+        let current_index: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+
+        // Generate the dummy payload once to save CPU
+        let mut dummy_payload = Vec::new(&env);
+        for i in 0..payload_size_bytes {
+            dummy_payload.push_back((i % 255) as u8); // Deterministic pattern
+        }
+
+        for i in 0..record_count {
+            let offset = current_index + i;
+            let entry_key = DataKey::StressDataEntry(caller.clone(), offset);
+            env.storage().persistent().set(&entry_key, &dummy_payload);
+        }
+
+        let new_index = current_index + record_count;
+        env.storage().persistent().set(&count_key, &new_index);
+
+        env.events().publish(
+            (symbol_short!("stress"), caller.clone()),
+            (record_count, payload_size_bytes, new_index)
+        );
+
+        Ok(new_index)
+    }
+
+    /// Cleans up previously generated storage stress data, recovering network space.
+    ///
+    /// # Security Assumptions
+    /// - Restricted to the contract `Admin`.
+    /// - Bounded by `max_remove` to allow chunked cleanup without CPU exhaustion.
+    pub fn cleanup_storage_stress(
+        env: Env,
+        caller: Address,
+        max_remove: u32,
+    ) -> Result<u32, RevoraError> {
+        Self::require_not_frozen(&env)?;
+        caller.require_auth();
+
+        let admin: Address = env.storage().persistent().get(&DataKey::Admin).ok_or(RevoraError::NotInitialized)?;
+        if caller != admin {
+            panic!("not admin");
+        }
+
+        let count_key = DataKey::StressDataCount(caller.clone());
+        let current_index: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+
+        if current_index == 0 {
+            return Ok(0); // Nothing to clean
+        }
+
+        let remove_count = if current_index < max_remove { current_index } else { max_remove };
+
+        for i in 0..remove_count {
+            let offset = current_index - 1 - i;
+            let entry_key = DataKey::StressDataEntry(caller.clone(), offset);
+            env.storage().persistent().remove(&entry_key);
+        }
+
+        let new_index = current_index - remove_count;
+        if new_index == 0 {
+            env.storage().persistent().remove(&count_key);
+        } else {
+            env.storage().persistent().set(&count_key, &new_index);
+        }
+
+        env.events().publish(
+            (symbol_short!("clnstrss"), caller.clone()), // "clnstrss" instead of "cleanup" because symbols max 9 chars
+            (remove_count, new_index)
+        );
+
+        Ok(remove_count)
     }
 }
 

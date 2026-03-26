@@ -8085,3 +8085,76 @@ mod scenarios {
 }
 } // mod regression
 
+// ── Storage Stress Automation ────────────────────────────────────────────────
+
+#[test]
+fn test_automate_storage_stress_success() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    
+    let admin = Address::generate(&env);
+    client.initialize(&admin, &None, &None);
+
+    let res1 = client.automate_storage_stress(&admin, &100, &100);
+    assert_eq!(res1, 100);
+
+    let res2 = client.automate_storage_stress(&admin, &50, &100);
+    assert_eq!(res2, 150);
+}
+
+#[test]
+#[should_panic(expected = "not admin")]
+fn test_automate_storage_stress_not_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    
+    let admin = Address::generate(&env);
+    client.initialize(&admin, &None, &None);
+
+    let not_admin = Address::generate(&env);
+    client.automate_storage_stress(&not_admin, &100, &100);
+}
+
+#[test]
+fn test_automate_storage_stress_limits() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    
+    let admin = Address::generate(&env);
+    client.initialize(&admin, &None, &None);
+
+    // Exceeds max count
+    let res = client.try_automate_storage_stress(&admin, &1001, &100);
+    assert!(res.is_err());
+
+    // Exceeds max payload
+    let res2 = client.try_automate_storage_stress(&admin, &100, &10001);
+    assert!(res2.is_err());
+}
+
+#[test]
+fn test_cleanup_storage_stress_success() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    
+    let admin = Address::generate(&env);
+    client.initialize(&admin, &None, &None);
+
+    client.automate_storage_stress(&admin, &50, &10);
+    
+    // Partial cleanup
+    let clean1 = client.cleanup_storage_stress(&admin, &20);
+    assert_eq!(clean1, 20);
+
+    // Remaining cleanup
+    let clean2 = client.cleanup_storage_stress(&admin, &100);
+    assert_eq!(clean2, 30);
+
+    // Empty cleanup
+    let clean3 = client.cleanup_storage_stress(&admin, &100);
+    assert_eq!(clean3, 0);
+}
