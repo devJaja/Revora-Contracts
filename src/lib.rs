@@ -1453,13 +1453,14 @@ impl RevoraRevenueShare {
     /// This operation is idempotent.
     ///
     /// ### Parameters
-    /// - `caller`: The address authorized to manage the blacklist. Must provide authentication.
+    /// - `caller`: The address authorized to manage the blacklist. Must be the current issuer of the offering.
     /// - `token`: The token representing the offering.
     /// - `investor`: The address to be blacklisted.
     ///
     /// ### Returns
     /// - `Ok(())` on success.
     /// - `Err(RevoraError::ContractFrozen)` if the contract is frozen.
+    /// - `Err(RevoraError::NotAuthorized)` if caller is not the current issuer.
     pub fn blacklist_add(
         env: Env,
         caller: Address,
@@ -1478,6 +1479,15 @@ impl RevoraRevenueShare {
             token: token.clone(),
         };
 
+        let current_issuer =
+            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+
+        // Verify auth: caller must be the current issuer
+        if caller != current_issuer {
+            return Err(RevoraError::NotAuthorized);
+        }
+
         if !Self::is_event_only(&env) {
             let key = DataKey::Blacklist(offering_id.clone());
             let mut map: Map<Address, bool> =
@@ -1485,15 +1495,6 @@ impl RevoraRevenueShare {
 
             map.set(investor.clone(), true);
             env.storage().persistent().set(&key, &map);
-        }
-        // Verify auth: caller must be issuer or admin
-        let current_issuer =
-            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
-                .ok_or(RevoraError::OfferingNotFound)?;
-        let admin = Self::get_admin(env.clone()).ok_or(RevoraError::NotInitialized)?;
-
-        if caller != current_issuer && caller != admin {
-            return Err(RevoraError::NotAuthorized);
         }
 
         let key = DataKey::Blacklist(offering_id.clone());
@@ -1523,13 +1524,14 @@ impl RevoraRevenueShare {
     /// This operation is idempotent.
     ///
     /// ### Parameters
-    /// - `caller`: The address authorized to manage the blacklist. Must provide authentication.
+    /// - `caller`: The address authorized to manage the blacklist. Must be the current issuer of the offering.
     /// - `token`: The token representing the offering.
     /// - `investor`: The address to be removed from the blacklist.
     ///
     /// ### Returns
     /// - `Ok(())` on success.
     /// - `Err(RevoraError::ContractFrozen)` if the contract is frozen.
+    /// - `Err(RevoraError::NotAuthorized)` if caller is not the current issuer.
     pub fn blacklist_remove(
         env: Env,
         caller: Address,
@@ -1551,8 +1553,9 @@ impl RevoraRevenueShare {
         let current_issuer =
             Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
                 .ok_or(RevoraError::OfferingNotFound)?;
-        let admin = Self::get_admin(env.clone()).ok_or(RevoraError::NotInitialized)?;
-        if caller != current_issuer && caller != admin {
+
+        // Verify auth: caller must be the current issuer
+        if caller != current_issuer {
             return Err(RevoraError::NotAuthorized);
         }
 

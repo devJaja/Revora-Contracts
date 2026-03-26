@@ -6,7 +6,7 @@ Soroban contract for revenue-share offerings and blacklist management.
 
 *- **Issuer authority:** Only the offering issuer can register offerings, report revenue, set concentration limits, set rounding mode, and report concentration for that offering. The contract does not implement a separate "platform admin" role; all offering-level actions are issuer-authorized.
 - **Issuer transferability:** Issuer control can be securely transferred via a two-step propose/accept flow. The old issuer proposes, the new issuer accepts. Either party can abort before acceptance (old issuer cancels, or new issuer simply doesn't accept). This prevents accidental loss of control and griefing attacks.
-- **Blacklist authority:** Any address that passes `require_auth` can add/remove blacklist entries for any token. The contract does not restrict blacklist edits to the issuer. Integrators must enforce policy off-chain or via a wrapper if only the issuer should manage the blacklist.ontract:** `RevoraRevenueShare`
+- **Blacklist authority:** Only the current issuer of the offering can add/remove blacklist entries for that offering's token. This ensures issuers have full control over compliance and investor management.
 
 ### Public methods
 
@@ -18,8 +18,8 @@ Soroban contract for revenue-share offerings and blacklist management.
 | `report_revenue` | `issuer: Address`, `token: Address`, `amount: i128`, `period_id: u64` | `Result<(), RevoraError>` | issuer | Emit a revenue report; event includes current blacklist. Updates audit summary. Fails with `ConcentrationLimitExceeded` if holder concentration enforcement is on and reported concentration exceeds limit. |
 | `get_offering_count` | `issuer: Address` | `u32` | — | Total offerings registered by issuer. |
 | `get_offerings_page` | `issuer: Address`, `start: u32`, `limit: u32` | `(Vec<Offering>, Option<u32>)` | — | Paginated offerings. `limit` capped at 20. `next_cursor` is `Some(next_start)` or `None`. |
-| `blacklist_add` | `caller: Address`, `token: Address`, `investor: Address` | — | caller | Add investor to blacklist for token. Idempotent. |
-| `blacklist_remove` | `caller: Address`, `token: Address`, `investor: Address` | — | caller | Remove investor from blacklist. Idempotent. |
+| `blacklist_add` | `caller: Address`, `token: Address`, `investor: Address` | — | issuer | Add investor to blacklist for token. Only the current issuer can perform this action. Idempotent. |
+| `blacklist_remove` | `caller: Address`, `token: Address`, `investor: Address` | — | issuer | Remove investor from blacklist. Only the current issuer can perform this action. Idempotent. |
 | `is_blacklisted` | `token: Address`, `investor: Address` | `bool` | — | Whether investor is blacklisted for token. |
 | `get_blacklist` | `token: Address` | `Vec<Address>` | — | All blacklisted addresses for token. |
 | `set_concentration_limit` | `issuer: Address`, `token: Address`, `max_bps: u32`, `enforce: bool` | `Result<(), RevoraError>` | issuer | Set per-offering max single-holder concentration (bps). 0 = disabled. If `enforce` is true, `report_revenue` fails when reported concentration > `max_bps`. Offering must exist. |
@@ -2245,7 +2245,7 @@ This section enumerates key security assumptions, trust boundaries, and mitigati
 ### Assumptions and trust boundaries
 
 - **Issuer authority:** Only the offering issuer can register offerings, report revenue, set concentration limits, set rounding mode, and report concentration for that offering. The contract does not implement a separate “platform admin” role; all offering-level actions are issuer-authorized.
-- **Blacklist authority:** Any address that passes `require_auth` can add/remove blacklist entries for any token. The contract does not restrict blacklist edits to the issuer. Integrators must enforce policy off-chain or via a wrapper if only the issuer should manage the blacklist.
+- **Blacklist authority:** Only the current issuer of the offering can add/remove blacklist entries for that offering's token. This ensures issuers have full control over compliance and investor management.
 - **Concentration data:** Holder concentration is not derived on-chain. The contract trusts the value passed to `report_concentration`. Enforcing or warning is based on this reported value; manipulation of the reported value can bypass the guardrail.
 - **Revenue reports:** The contract does not verify that reported revenue amounts are correct or consistent with any external source. It only records and aggregates them for the audit summary and emits events.
 
@@ -2253,7 +2253,7 @@ This section enumerates key security assumptions, trust boundaries, and mitigati
 
 | Risk | Mitigation |
 |------|------------|
-| **Auth misuse / wrong signer** | All state-changing entrypoints call `require_auth` on the appropriate address. Auth failures cause host panic; use `try_*` client methods to handle errors. Tests: `blacklist_add_requires_auth`, `blacklist_remove_requires_auth`. |
+| **Auth misuse / wrong signer** | All state-changing entrypoints call `require_auth` on the appropriate address. Auth failures cause host panic; use `try_*` client methods to handle errors. Issuer-only enforcement for blacklist operations. Tests: `blacklist_add_requires_auth`, `blacklist_remove_requires_auth`, `blacklist_add_requires_issuer_auth`, `blacklist_remove_requires_issuer_auth`. |
 | **Issuer transfer security** | Two-step propose/accept flow prevents accidental loss of control. Old issuer must propose, new issuer must explicitly accept. Either can abort (old cancels, new doesn't accept). Current issuer verified via reverse lookup on all auth checks. Tests: `issuer_transfer_*` (35 tests covering happy path, abuse attempts, edge cases, and integration). |
 | **Incorrect math (overflow, rounding)** | Revenue share bps is capped at 10000. `compute_share` uses checked arithmetic where applicable and clamps output to [0, amount]. Rounding modes (Truncation, RoundHalfUp) are documented and tested. Tests: `compute_share_*`, `register_offering_rejects_bps_over_10000`. |
 | **Concentration guardrail bypass** | Enforcement is applied in `report_revenue` using the last value set by `report_concentration`. If concentration is not reported or is reported low, enforcement cannot block. Design: guardrail is advisory or best-effort unless the issuer reliably reports concentration before each report. Tests: concentration_enforce_blocks_report_revenue_when_over_limit, concentration_near_threshold_boundary. |
