@@ -633,6 +633,11 @@ impl RevoraRevenueShare {
         amount: i128,
         period_id: u64,
     ) -> Result<(), RevoraError> {
+        // Zero-value revenue policy: reject zero or negative amounts
+        if amount <= 0 {
+            return Err(RevoraError::InvalidAmount);
+        }
+
         let offering_id = OfferingId {
             issuer: issuer.clone(),
             namespace: namespace.clone(),
@@ -1065,6 +1070,11 @@ impl RevoraRevenueShare {
         Self::require_not_frozen(&env)?;
         Self::require_not_paused(&env);
         issuer.require_auth();
+
+        // Zero-value revenue policy: reject zero or negative amounts
+        if amount <= 0 {
+            return Err(RevoraError::InvalidAmount);
+        }
 
         let event_only = Self::is_event_only(&env);
         let offering_id = OfferingId {
