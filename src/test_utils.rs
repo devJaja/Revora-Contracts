@@ -15,3 +15,5 @@ pub fn setup_context() -> (Env, RevoraRevenueShareClient<'static>, Address, Addr
     let payout_asset = Address::generate(&env);
     (env, client, contract_id, issuer, token, payout_asset)
 }
+
+// Helper to create a new namespace
