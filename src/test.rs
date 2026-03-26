@@ -2465,8 +2465,8 @@ fn audit_summary_aggregates_revenue_and_count() {
     assert_eq!(summary.clone().unwrap().total_revenue, 600);
     assert_eq!(summary.clone().unwrap().report_count, 3);
     let s = summary.unwrap();
-    assert_eq!(s.unwrap().total_revenue, 600);
-    assert_eq!(s.unwrap().report_count, 3);
+    assert_eq!(s.total_revenue, 600);
+    assert_eq!(s.report_count, 3);
 }
 
 #[test]
@@ -2507,10 +2507,10 @@ fn audit_summary_per_offering_isolation() {
     assert_eq!(sum_b.clone().unwrap().report_count, 1);
     let a = sum_a.unwrap();
     let b = sum_b.unwrap();
-    assert_eq!(a.unwrap().total_revenue, 1000);
-    assert_eq!(a.unwrap().report_count, 1);
-    assert_eq!(b.unwrap().total_revenue, 2000);
-    assert_eq!(b.unwrap().report_count, 1);
+    assert_eq!(a.total_revenue, 1000);
+    assert_eq!(a.report_count, 1);
+    assert_eq!(b.total_revenue, 2000);
+    assert_eq!(b.report_count, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -5004,8 +5004,8 @@ fn issuer_transfer_preserves_audit_summary() {
 
     // Audit summary should still be accessible
     let summary_after = client.get_audit_summary(&issuer, &symbol_short!("def"), &token).unwrap();
-    assert_eq!(summary_before.unwrap().total_revenue, summary_after.unwrap().total_revenue);
-    assert_eq!(summary_before.unwrap().report_count, summary_after.unwrap().report_count);
+    assert_eq!(summary_before.total_revenue, summary_after.total_revenue);
+    assert_eq!(summary_before.report_count, summary_after.report_count);
 }
 
 #[test]
@@ -5218,8 +5218,8 @@ fn testnet_mode_normal_operations_unaffected() {
     assert_eq!(summary.clone().unwrap().total_revenue, 1_000_000);
     assert_eq!(summary.clone().unwrap().report_count, 1);
     let summary = client.get_audit_summary(&issuer, &symbol_short!("def"), &token).unwrap();
-    assert_eq!(summary.unwrap().total_revenue, 1_000_000);
-    assert_eq!(summary.unwrap().report_count, 1);
+    assert_eq!(summary.total_revenue, 1_000_000);
+    assert_eq!(summary.report_count, 1);
 }
 
 #[test]
@@ -7016,8 +7016,8 @@ mod regression {
             &false,
         );
         let summary = client.get_audit_summary(&issuer, &symbol_short!("def"), &token).unwrap();
-        assert_eq!(summary.unwrap().report_count, 1);
-        assert_eq!(summary.unwrap().total_revenue, 1_000);
+        assert_eq!(summary.report_count, 1);
+        assert_eq!(summary.total_revenue, 1_000);
         client.report_revenue(
             &issuer,
             &symbol_short!("def"),
@@ -7028,8 +7028,8 @@ mod regression {
             &false,
         );
         let summary2 = client.get_audit_summary(&issuer, &symbol_short!("def"), &token).unwrap();
-        assert_eq!(summary2.unwrap().report_count, 2);
-        assert_eq!(summary2.unwrap().total_revenue, 3_000);
+        assert_eq!(summary2.report_count, 2);
+        assert_eq!(summary2.total_revenue, 3_000);
     }
 
     #[test]
@@ -7047,7 +7047,7 @@ mod regression {
             &false,
         );
         let summary = client.get_audit_summary(&issuer, &symbol_short!("def"), &token).unwrap();
-        assert_eq!(summary.unwrap().report_count, 1);
+        assert_eq!(summary.report_count, 1);
     }
 
     #[test]
