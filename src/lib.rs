@@ -3048,7 +3048,7 @@ impl RevoraRevenueShare {
     /// Emits event. Claim and read-only functions remain allowed.
     /// If multisig is initialized, this function is disabled in favor of execute_action(Freeze).
     pub fn freeze(env: Env) -> Result<(), RevoraError> {
-        if env.storage().persistent().has(&DataKey::MultisigThreshold) -> Result<(), RevoraError> {
+        if env.storage().persistent().has(&DataKey::MultisigThreshold) {
             return Err(RevoraError::LimitReached);
         }
         let key = DataKey::Admin;
