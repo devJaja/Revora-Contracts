@@ -1518,6 +1518,7 @@ impl RevoraRevenueShare {
     /// - `Ok(())` on success.
     /// - `Err(RevoraError::OfferingNotFound)` if the offering is not registered.
     /// - `Err(RevoraError::NotAuthorized)` if the caller is not authorized.
+    pub fn blacklist_remove(
         env: Env,
         caller: Address,
         issuer: Address,
