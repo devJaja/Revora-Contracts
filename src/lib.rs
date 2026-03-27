@@ -628,6 +628,10 @@ impl RevoraRevenueShare {
             token: token.clone(),
         };
 
+        // Validate inputs (#35)
+        Self::require_valid_period_id(period_id)?;
+        Self::require_positive_amount(amount)?;
+
         // Verify offering exists
         if Self::get_offering(env.clone(), issuer.clone(), namespace.clone(), token.clone())
             .is_none()
@@ -724,7 +728,6 @@ impl RevoraRevenueShare {
     }
 
     /// Input validation (#35): require period_id > 0 where 0 would be ambiguous.
-    #[allow(dead_code)]
     fn require_valid_period_id(period_id: u64) -> Result<(), RevoraError> {
         if period_id == 0 {
             return Err(RevoraError::InvalidPeriodId);
@@ -1053,6 +1056,8 @@ impl RevoraRevenueShare {
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
         Self::require_not_paused(&env);
+        Self::require_valid_period_id(period_id)?;
+        Self::require_non_negative_amount(amount)?;
         issuer.require_auth();
 
         let event_only = Self::is_event_only(&env);
@@ -3998,3 +4003,4 @@ mod test;
 mod test_auth;
 mod test_cross_contract;
 mod test_namespaces;
+mod test_period_id_boundary;
