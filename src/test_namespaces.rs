@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use crate::{RevoraRevenueShare, RevoraRevenueShareClient};
+use crate::{AggregatedMetrics, RevoraRevenueShare, RevoraRevenueShareClient};
 use soroban_sdk::{symbol_short, testutils::Address as _, Address, Env};
 
 fn make_client(env: &Env) -> RevoraRevenueShareClient<'_> {
