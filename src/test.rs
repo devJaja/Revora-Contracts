@@ -20,6 +20,7 @@ fn make_client(env: &Env) -> RevoraRevenueShareClient<'_> {
 
 
 /// Helper to extract legacy events skipping ev_idx2 indexed events
+#[allow(clippy::all)]
 fn legacy_events(env: &soroban_sdk::Env) -> soroban_sdk::Vec<(soroban_sdk::Address, soroban_sdk::Val, soroban_sdk::Val)> {
     let all = env.events().all();
     let mut filtered = soroban_sdk::Vec::new(env);
@@ -27,8 +28,8 @@ fn legacy_events(env: &soroban_sdk::Env) -> soroban_sdk::Vec<(soroban_sdk::Addre
     for i in 0..all.len() {
         let ev = all.get(i).unwrap();
         let topics: soroban_sdk::Vec<soroban_sdk::Val> = ev.1.clone().into_val(env);
-        let is_indexed = if topics.len() > 0 {
-            topics.get(0).unwrap() == idx2_sym
+        let is_indexed = if !topics.is_empty() {
+            topics.first().unwrap() == idx2_sym
         } else {
             false
         };
