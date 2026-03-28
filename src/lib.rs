@@ -1637,9 +1637,14 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
     }
 
     /// Read-only: sum revenue for a numeric period range but bounded by `max_periods` per call.
+    ///
     /// Returns `(sum, next_start)` where `next_start` is `Some(period)` if there are remaining
-    /// periods to process and a subsequent call can continue from that period. `max_periods` of 0
-    /// or > `MAX_CHUNK_PERIODS` will be capped to `MAX_CHUNK_PERIODS` to enforce limits.
+    /// periods to process and a subsequent call can continue from that period.
+    ///
+    /// ### Features & Security
+    /// - **Determinism**: The query is read-only and uses capped iterations to prevent CPU/Gas exhaustion.
+    /// - **Input Validation**: Automatically handles `from_period > to_period` by returning an empty result.
+    /// - **Capping**: `max_periods` of 0 or > `MAX_CHUNK_PERIODS` will be capped to `MAX_CHUNK_PERIODS`.
     pub fn get_revenue_range_chunk(
         env: Env,
         issuer: Address,
@@ -1649,6 +1654,10 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
         to_period: u64,
         max_periods: u32,
     ) -> (i128, Option<u64>) {
+        if from_period > to_period {
+            return (0, None);
+        }
+
         let mut total: i128 = 0;
         let mut processed: u32 = 0;
         let cap = if max_periods == 0 || max_periods > MAX_CHUNK_PERIODS {
@@ -1662,13 +1671,13 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
             if processed >= cap {
                 return (total, Some(p));
             }
-            total += Self::get_revenue_by_period(
+            total = total.saturating_add(Self::get_revenue_by_period(
                 env.clone(),
                 issuer.clone(),
                 namespace.clone(),
                 token.clone(),
                 p,
-            );
+            ));
             processed = processed.saturating_add(1);
             p = p.saturating_add(1);
         }

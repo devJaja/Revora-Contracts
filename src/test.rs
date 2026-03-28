@@ -16,7 +16,7 @@ use crate::proptest_helpers::{any_test_operation, TestOperation};
 
 // ── helper ────────────────────────────────────────────────────
 
-fn make_client(env: &Env) -> RevoraRevenueShareClient<'_> {
+fn make_client(env: &Env) -> RevoraRevenueShareClient {
     let id = env.register_contract(None, RevoraRevenueShare);
     RevoraRevenueShareClient::new(env, &id)
 }
