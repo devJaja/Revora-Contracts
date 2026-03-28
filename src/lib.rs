@@ -197,7 +197,7 @@ const BPS_DENOMINATOR: i128 = 10_000;
 /// Offerings are immutable once registered.
 // ── Data structures ──────────────────────────────────────────
 /// Contract version identifier (#23). Bumped when storage or semantics change; used for migration and compatibility.
-pub const CONTRACT_VERSION: u32 = 2;
+pub const CONTRACT_VERSION: u32 = 3;
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -1385,6 +1385,7 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
             namespace: namespace.clone(),
             token: token.clone(),
         };
+        Self::require_not_offering_frozen(&env, &offering_id)?;
         Self::require_report_window_open(&env, &offering_id)?;
 
         // Enforce period ordering invariant
@@ -1859,6 +1860,7 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
             namespace: namespace.clone(),
             token: token.clone(),
         };
+        Self::require_not_offering_frozen(&env, &offering_id)?;
 
         let key = DataKey::Blacklist(offering_id.clone());
         let mut map: Map<Address, bool> =
@@ -1933,16 +1935,21 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
         namespace: Symbol,
         token: Address,
         investor: Address,
-    ) {
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        Self::require_not_paused(&env);
         caller.require_auth();
         let current_issuer =
             Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
-                .expect("offering not found");
-        if caller != current_issuer {
-            panic!("not authorized");
+                .ok_or(RevoraError::OfferingNotFound)?;
+        let admin = Self::get_admin(env.clone());
+        let is_admin = admin.as_ref().map(|a| caller == *a).unwrap_or(false);
+        if caller != current_issuer && !is_admin {
+            return Err(RevoraError::NotAuthorized);
         }
 
         let offering_id = OfferingId { issuer, namespace, token };
+        Self::require_not_offering_frozen(&env, &offering_id)?;
         let key = DataKey::Whitelist(offering_id.clone());
         let mut map: Map<Address, bool> =
             env.storage().persistent().get(&key).unwrap_or_else(|| Map::new(&env));
@@ -1959,6 +1966,7 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
             ),
             (caller, investor),
         );
+        Ok(())
     }
 
     /// Remove `investor` from the per-offering whitelist for `token`.
@@ -1972,16 +1980,21 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
         namespace: Symbol,
         token: Address,
         investor: Address,
-    ) {
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        Self::require_not_paused(&env);
         caller.require_auth();
         let current_issuer =
             Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
-                .expect("offering not found");
-        if caller != current_issuer {
-            panic!("not authorized");
+                .ok_or(RevoraError::OfferingNotFound)?;
+        let admin = Self::get_admin(env.clone());
+        let is_admin = admin.as_ref().map(|a| caller == *a).unwrap_or(false);
+        if caller != current_issuer && !is_admin {
+            return Err(RevoraError::NotAuthorized);
         }
 
         let offering_id = OfferingId { issuer, namespace, token };
+        Self::require_not_offering_frozen(&env, &offering_id)?;
         let key = DataKey::Whitelist(offering_id.clone());
         let mut map: Map<Address, bool> =
             env.storage().persistent().get(&key).unwrap_or_else(|| Map::new(&env));
@@ -1998,6 +2011,7 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
             ),
             (caller, investor),
         );
+        Ok(())
     }
 
     /// Returns `true` if `investor` is whitelisted for `token`'s offering.
@@ -2097,6 +2111,8 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
         if current_issuer != issuer {
             return Err(RevoraError::LimitReached);
         }
+
+        Self::require_not_offering_frozen(&env, &offering_id)?;
 
         if !Self::is_event_only(&env) {
             issuer.require_auth();
@@ -2235,6 +2251,7 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
         if current_issuer != issuer {
             return Err(RevoraError::OfferingNotFound);
         }
+        Self::require_not_offering_frozen(&env, &offering_id)?;
         issuer.require_auth();
         let key = DataKey::RoundingMode(offering_id);
         env.storage().persistent().set(&key, &mode);
@@ -2277,6 +2294,7 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
         if current_issuer != issuer {
             return Err(RevoraError::OfferingNotFound);
         }
+        Self::require_not_offering_frozen(&env, &offering_id)?;
         issuer.require_auth();
 
         // Negative Amount Validation Matrix: InvestmentMinStake requires >= 0 (#163)
@@ -2348,6 +2366,7 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
             return Err(RevoraError::OfferingNotFound);
         }
 
+        Self::require_not_offering_frozen(&env, &offering_id)?;
         issuer.require_auth();
 
         // Negative Amount Validation Matrix: MinRevenueThreshold requires >= 0 (#163)
@@ -2450,6 +2469,13 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
             return Err(RevoraError::OfferingNotFound);
         }
 
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+        Self::require_not_offering_frozen(&env, &offering_id)?;
+
         Self::do_deposit_revenue(&env, issuer, namespace, token, payment_token, amount, period_id)
     }
 
@@ -2489,6 +2515,7 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
             namespace: namespace.clone(),
             token: token.clone(),
         };
+        Self::require_not_offering_frozen(&env, &offering_id)?;
 
         // 2. Validate snapshot reference is strictly monotonic using matrix helper
         let snap_key = DataKey::LastSnapshotRef(offering_id.clone());
@@ -2537,6 +2564,7 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
             return Err(RevoraError::OfferingNotFound);
         }
         let offering_id = OfferingId { issuer, namespace, token };
+        Self::require_not_offering_frozen(&env, &offering_id)?;
         let key = DataKey::SnapshotConfig(offering_id.clone());
         env.storage().persistent().set(&key, &enabled);
         env.events().publish(
@@ -2876,6 +2904,7 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
             return Err(RevoraError::OfferingNotFound);
         }
 
+        Self::require_not_offering_frozen(&env, &offering_id)?;
         issuer.require_auth();
         Self::set_holder_share_internal(
             &env,
@@ -2966,6 +2995,7 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
             namespace: payload.namespace.clone(),
             token: payload.token.clone(),
         };
+        Self::require_not_offering_frozen(&env, &offering_id)?;
         let configured_delegate: Address = env
             .storage()
             .persistent()
@@ -3020,6 +3050,7 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
             namespace: payload.namespace.clone(),
             token: payload.token.clone(),
         };
+        Self::require_not_offering_frozen(&env, &offering_id)?;
         let configured_delegate: Address = env
             .storage()
             .persistent()
@@ -3583,6 +3614,7 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
             return Err(RevoraError::OfferingNotFound);
         }
 
+        Self::require_not_offering_frozen(&env, &offering_id)?;
         issuer.require_auth();
         let key = DataKey::ClaimDelaySecs(offering_id);
         env.storage().persistent().set(&key, &delay_secs);
@@ -3826,6 +3858,94 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
         Ok(())
     }
 
+    /// Freeze a single offering while keeping other offerings operational.
+    ///
+    /// Authorization boundary:
+    /// - Current issuer for the offering, or
+    /// - Global admin
+    ///
+    /// Security posture:
+    /// - This action is blocked when the whole contract is globally frozen (fail-closed).
+    /// - Claims remain intentionally allowed for frozen offerings so users can exit.
+    pub fn freeze_offering(
+        env: Env,
+        caller: Address,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        caller.require_auth();
+
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+
+        let current_issuer =
+            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+        let admin = Self::get_admin(env.clone());
+        let is_admin = admin.as_ref().map(|a| caller == *a).unwrap_or(false);
+        if caller != current_issuer && !is_admin {
+            return Err(RevoraError::NotAuthorized);
+        }
+
+        let key = DataKey::FrozenOffering(offering_id);
+        env.storage().persistent().set(&key, &true);
+        env.events().publish((EVENT_FREEZE_OFFERING, issuer, namespace, token), (caller, true));
+        Ok(())
+    }
+
+    /// Unfreeze a single offering.
+    ///
+    /// Authorization mirrors `freeze_offering`: issuer or admin.
+    pub fn unfreeze_offering(
+        env: Env,
+        caller: Address,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        caller.require_auth();
+
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+
+        let current_issuer =
+            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+        let admin = Self::get_admin(env.clone());
+        let is_admin = admin.as_ref().map(|a| caller == *a).unwrap_or(false);
+        if caller != current_issuer && !is_admin {
+            return Err(RevoraError::NotAuthorized);
+        }
+
+        let key = DataKey::FrozenOffering(offering_id);
+        env.storage().persistent().set(&key, &false);
+        env.events().publish((EVENT_UNFREEZE_OFFERING, issuer, namespace, token), (caller, false));
+        Ok(())
+    }
+
+    /// Return true if an individual offering is frozen.
+    pub fn is_offering_frozen(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+    ) -> bool {
+        let offering_id = OfferingId { issuer, namespace, token };
+        env.storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::FrozenOffering(offering_id))
+            .unwrap_or(false)
+    }
+
     /// Return true if the contract is frozen.
     pub fn is_frozen(env: Env) -> bool {
         env.storage().persistent().get::<DataKey, bool>(&DataKey::Frozen).unwrap_or(false)
@@ -3952,6 +4072,7 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
                 env.storage().persistent().set(&DataKey::Admin, &new_admin);
             }
             ProposalAction::Freeze => {
+                Self::require_not_frozen(&env)?;
                 env.storage().persistent().set(&DataKey::Frozen, &true);
                 env.events().publish((EVENT_FREEZE, proposal.proposer.clone()), true);
             }
@@ -4537,6 +4658,7 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
             return Err(RevoraError::OfferingNotFound);
         }
 
+        Self::require_not_offering_frozen(&env, &offering_id)?;
         issuer.require_auth();
 
         // Validate metadata length and allowed scheme prefixes.

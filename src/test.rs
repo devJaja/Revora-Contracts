@@ -3924,6 +3924,91 @@ fn freeze_succeeds_when_called_by_admin() {
     assert!(client.is_frozen());
 }
 
+#[test]
+fn freeze_offering_sets_flag_and_emits_event() {
+    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let before = env.events().all().len();
+
+    assert!(!client.is_offering_frozen(&issuer, &symbol_short!("def"), &token));
+    client.freeze_offering(&issuer, &issuer, &symbol_short!("def"), &token);
+    assert!(client.is_offering_frozen(&issuer, &symbol_short!("def"), &token));
+    assert!(env.events().all().len() > before);
+}
+
+#[test]
+fn freeze_offering_blocks_only_target_offering() {
+    let (env, client, issuer, token_a, payment_token, _contract_id) = claim_setup();
+    let token_b = Address::generate(&env);
+    client.register_offering(&issuer, &symbol_short!("def"), &token_b, &5_000, &payment_token, &0);
+
+    let holder = Address::generate(&env);
+    client.freeze_offering(&issuer, &issuer, &symbol_short!("def"), &token_a);
+
+    let blocked =
+        client.try_set_holder_share(&issuer, &symbol_short!("def"), &token_a, &holder, &2_500);
+    assert!(blocked.is_err());
+
+    let allowed =
+        client.try_set_holder_share(&issuer, &symbol_short!("def"), &token_b, &holder, &2_500);
+    assert!(allowed.is_ok());
+}
+
+#[test]
+fn freeze_offering_rejects_unauthorized_caller_no_mutation() {
+    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let bad_actor = Address::generate(&env);
+
+    let r = client.try_freeze_offering(&bad_actor, &issuer, &symbol_short!("def"), &token);
+    assert!(r.is_err());
+    assert!(!client.is_offering_frozen(&issuer, &symbol_short!("def"), &token));
+}
+
+#[test]
+fn freeze_offering_missing_offering_rejected() {
+    let (env, client, issuer, _token, _payment_token, _contract_id) = claim_setup();
+    let unknown_token = Address::generate(&env);
+
+    let r = client.try_freeze_offering(&issuer, &issuer, &symbol_short!("def"), &unknown_token);
+    assert!(r.is_err());
+}
+
+#[test]
+fn freeze_offering_unfreeze_by_admin_restores_mutation_path() {
+    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let admin = Address::generate(&env);
+    let holder = Address::generate(&env);
+
+    client.set_admin(&admin);
+    client.freeze_offering(&admin, &issuer, &symbol_short!("def"), &token);
+    assert!(client.is_offering_frozen(&issuer, &symbol_short!("def"), &token));
+
+    let blocked =
+        client.try_set_holder_share(&issuer, &symbol_short!("def"), &token, &holder, &2_500);
+    assert!(blocked.is_err());
+
+    client.unfreeze_offering(&admin, &issuer, &symbol_short!("def"), &token);
+    assert!(!client.is_offering_frozen(&issuer, &symbol_short!("def"), &token));
+
+    let allowed =
+        client.try_set_holder_share(&issuer, &symbol_short!("def"), &token, &holder, &2_500);
+    assert!(allowed.is_ok());
+}
+
+#[test]
+fn global_freeze_blocks_offering_freeze_endpoints() {
+    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let admin = Address::generate(&env);
+
+    client.set_admin(&admin);
+    client.freeze();
+
+    let freeze_r = client.try_freeze_offering(&admin, &issuer, &symbol_short!("def"), &token);
+    assert!(freeze_r.is_err());
+
+    let unfreeze_r = client.try_unfreeze_offering(&admin, &issuer, &symbol_short!("def"), &token);
+    assert!(unfreeze_r.is_err());
+}
+
 // ===========================================================================
 // Snapshot-based distribution (#Snapshot)
 // ===========================================================================
