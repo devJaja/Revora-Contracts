@@ -2705,6 +2705,39 @@ impl RevoraRevenueShare {
     /// - `Err(RevoraError::HolderBlacklisted)` if the holder is blacklisted.
     /// - `Err(RevoraError::NoPendingClaims)` if no share is set or all periods are claimed.
     /// - `Err(RevoraError::ClaimDelayNotElapsed)` if the next period is still within the claim delay window.
+    ///
+    /// ### Idempotency and Safety Invariants
+    ///
+    /// This function provides the following hard guarantees:
+    ///
+    /// 1. **No double-pay**: `LastClaimedIdx` is written to storage only *after* the token
+    ///    transfer succeeds. If the transfer panics (e.g. insufficient contract balance),
+    ///    the index is not advanced and the holder may retry. Soroban's atomic transaction
+    ///    model ensures partial state is never committed.
+    ///
+    /// 2. **Index advances only on processed periods**: The index is set to
+    ///    `last_claimed_idx`, which reflects only periods that passed the delay check.
+    ///    Periods blocked by `ClaimDelaySecs` are not counted; the function returns
+    ///    `ClaimDelayNotElapsed` without writing any state.
+    ///
+    /// 3. **Zero-payout periods advance the index**: A period with `revenue = 0` (or
+    ///    where `revenue * share_bps / 10_000 == 0` due to truncation) still advances
+    ///    `LastClaimedIdx`. No transfer is issued for zero amounts. This prevents
+    ///    permanently stuck indices on dust periods.
+    ///
+    /// 4. **Exhausted state returns `NoPendingClaims`**: Once `LastClaimedIdx >= PeriodCount`,
+    ///    every subsequent call returns `Err(NoPendingClaims)` without touching storage.
+    ///    Callers may safely retry without risk of side effects.
+    ///
+    /// 5. **Per-holder isolation**: Each holder's `LastClaimedIdx` is keyed by
+    ///    `(offering_id, holder)`. One holder's claim progress never affects another's.
+    ///
+    /// 6. **Auth checked first**: `holder.require_auth()` is the first operation.
+    ///    All subsequent checks (blacklist, share, period count) are read-only and
+    ///    produce no state changes on failure.
+    ///
+    /// 7. **Blacklist check is pre-transfer**: A blacklisted holder is rejected before
+    ///    any storage write or token transfer occurs.
     pub fn claim(
         env: Env,
         holder: Address,
