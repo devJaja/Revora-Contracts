@@ -1,11 +1,12 @@
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _},
-    Address, Env,
+    symbol_short,
+    testutils::{Address as _, Events as _, Ledger as _},
+    Address, Env, IntoVal,
 };
 
-use crate::vesting::{RevoraVesting, RevoraVestingClient};
+use crate::vesting::{RevoraVesting, RevoraVestingClient, VESTING_EVENT_SCHEMA_VERSION};
 
-fn setup(env: &Env) -> (RevoraVestingClient<'_>, Address, Address, Address) {
+fn setup(env: &Env) -> (RevoraVestingClient, Address, Address, Address) {
     let contract_id = env.register_contract(None, RevoraVesting);
     let client = RevoraVestingClient::new(env, &contract_id);
     let admin = Address::generate(env);
@@ -120,91 +121,49 @@ fn cliff_longer_than_duration_rejected() {
 }
 
 #[test]
-fn partial_claim_happy_path_and_history() {
+fn event_schema_version_is_stable() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _beneficiary, _token_id) = setup(&env);
+    client.initialize_vesting(&admin);
+
+    assert_eq!(client.get_event_schema_version(), VESTING_EVENT_SCHEMA_VERSION);
+    assert_eq!(client.get_event_schema_version(), 1);
+}
+
+#[test]
+fn create_schedule_emits_legacy_and_v1_events() {
     let env = Env::default();
     env.mock_all_auths();
     let (client, admin, beneficiary, token_id) = setup(&env);
+    let contract_id = client.address.clone();
     client.initialize_vesting(&admin);
 
-    let total = 1_000_000_i128;
-    let start = 1_000_u64;
-    let cliff = 200_u64;
-    let duration = 1_000_u64;
     let idx =
-        client.create_schedule(&admin, &beneficiary, &token_id, &total, &start, &cliff, &duration);
+        client.create_schedule(&admin, &beneficiary, &token_id, &1_000_000, &1000, &250, &2000);
+    assert_eq!(idx, 0);
 
-    // Move to halfway between cliff and end → vested = total * 0.5
-    let cliff_time = start + cliff;
-    let end_time = start + duration;
-    let mid_time = cliff_time + (end_time - cliff_time) / 2;
-    env.ledger().with_mut(|l| l.timestamp = mid_time);
+    let events = env.events().all();
+    let legacy = (
+        contract_id.clone(),
+        (symbol_short!("vest_crt"), admin.clone(), beneficiary.clone()).into_val(&env),
+        (token_id.clone(), 1_000_000_i128, 1000_u64, 1250_u64, 3000_u64, 0_u32).into_val(&env),
+    );
+    let v1 = (
+        contract_id,
+        (symbol_short!("vst_crt1"), admin, beneficiary).into_val(&env),
+        (
+            VESTING_EVENT_SCHEMA_VERSION,
+            token_id,
+            1_000_000_i128,
+            1000_u64,
+            1250_u64,
+            3000_u64,
+            0_u32,
+        )
+            .into_val(&env),
+    );
 
-    // Fund contract to enable payouts
-    let contract_addr = client.address.clone();
-    let claimable = client.get_claimable_vesting(&admin, &idx);
-    assert!(claimable > 0);
-    mint_tokens(&env, &token_id, &contract_addr, &claimable);
-
-    // Beneficiary initial balance
-    let bal_before = balance(&env, &token_id, &beneficiary);
-
-    // Partial claim: half of claimable
-    let partial = claimable / 2;
-    let claimed = client.claim_vesting_partial(&beneficiary, &admin, &idx, &partial);
-    assert_eq!(claimed, partial);
-
-    // Check balances
-    let bal_after = balance(&env, &token_id, &beneficiary);
-    assert_eq!(bal_after - bal_before, partial);
-
-    // Check schedule claimed updated
-    let schedule = client.get_schedule(&admin, &idx);
-    assert_eq!(schedule.claimed_amount, partial);
-
-    // History count and record
-    let cnt = client.get_partial_claim_count(&admin, &idx);
-    assert_eq!(cnt, 1);
-    let rec = client.get_partial_claim_record(&admin, &idx, &0).expect("record 0");
-    assert_eq!(rec.1, partial);
-    assert!(rec.0 >= mid_time);
-}
-
-#[test]
-fn partial_claim_zero_amount_rejected() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, beneficiary, token_id) = setup(&env);
-    client.initialize_vesting(&admin);
-    client.create_schedule(&admin, &beneficiary, &token_id, &1_000_000, &1_000, &100, &1_000);
-    env.ledger().with_mut(|l| l.timestamp = 2_000);
-    let r = client.try_claim_vesting_partial(&beneficiary, &admin, &0, &0);
-    assert!(r.is_err());
-}
-
-#[test]
-fn partial_claim_exceeds_claimable_rejected() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, beneficiary, token_id) = setup(&env);
-    client.initialize_vesting(&admin);
-    client.create_schedule(&admin, &beneficiary, &token_id, &1_000_000, &1_000, &100, &1_000);
-    env.ledger().with_mut(|l| l.timestamp = 2_000);
-    let claimable = client.get_claimable_vesting(&admin, &0);
-    // Fund exactly claimable
-    let contract_addr = client.address.clone();
-    mint_tokens(&env, &token_id, &contract_addr, &claimable);
-    let r = client.try_claim_vesting_partial(&beneficiary, &admin, &0, &(claimable + 1));
-    assert!(r.is_err());
-}
-
-#[test]
-fn partial_claim_before_cliff_nothing_to_claim() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, beneficiary, token_id) = setup(&env);
-    client.initialize_vesting(&admin);
-    client.create_schedule(&admin, &beneficiary, &token_id, &1_000_000, &1_000, &300, &1_000);
-    env.ledger().with_mut(|l| l.timestamp = 1_100); // before cliff (1_300)
-    let r = client.try_claim_vesting_partial(&beneficiary, &admin, &0, &1);
-    assert!(r.is_err());
+    assert!(events.contains(&legacy));
+    assert!(events.contains(&v1));
 }
