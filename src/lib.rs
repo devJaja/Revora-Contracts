@@ -955,6 +955,10 @@ impl RevoraRevenueShare {
             token: token.clone(),
         };
 
+        // Validate inputs (#35)
+        Self::require_valid_period_id(period_id)?;
+        Self::require_positive_amount(amount)?;
+
         // Verify offering exists
         if Self::get_offering(env.clone(), issuer.clone(), namespace.clone(), token.clone())
             .is_none()
@@ -2656,6 +2660,10 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
         period_id: u64,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
+
+        // Input validation (#35): reject zero/invalid period_id and non-positive amounts.
+        Self::require_valid_period_id(period_id)?;
+        Self::require_positive_amount(amount)?;
 
         // Verify offering exists and issuer is current
         let current_issuer =
@@ -5238,3 +5246,4 @@ mod test_auth;
 mod test_cross_contract;
 #[cfg(test)]
 mod test_namespaces;
+mod test_period_id_boundary;

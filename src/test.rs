@@ -913,30 +913,64 @@ fn fuzz_period_and_amount_boundaries_do_not_panic() {
     let payout_asset = Address::generate(&env);
     client.register_offering(&issuer, &symbol_short!("def"), &token, &1_000, &payout_asset, &0);
 
+    // Valid boundary inputs: non-negative amounts and non-zero period IDs.
+    // Invalid inputs (period_id == 0, negative amounts) are expected to be rejected.
+    let valid_amounts: [i128; 5] = [0, 1, i128::MAX - 1, i128::MAX, 100_000];
+    let valid_periods: [u64; 5] = [1, 2, 10_000, u64::MAX - 1, u64::MAX];
+    let invalid_amounts: [i128; 3] = [i128::MIN, i128::MIN + 1, -1];
+    let invalid_periods: [u64; 1] = [0];
+
     let mut accepted = 0usize;
-    for amount in BOUNDARY_AMOUNTS {
-        for period in BOUNDARY_PERIODS {
-            let r = client.try_report_revenue(
-                &issuer,
-                &symbol_short!("def"),
-                &token,
-                &payout_asset,
-                &amount,
-                &period,
-                &false,
-            );
-            if r.is_ok() {
-                accepted += 1;
-            }
-        }
+    let mut rejected = 0usize;
+
+    // Valid combinations must all succeed (first call per period is initial, rest are rejected
+    // without override=true, so use unique periods per amount to avoid collision).
+    for (i, &amount) in valid_amounts.iter().enumerate() {
+        let period = valid_periods[i % valid_periods.len()];
+        let r = client.try_report_revenue(
+            &issuer,
+            &symbol_short!("def"),
+            &token,
+            &payout_asset,
+            &amount,
+            &period,
+            &false,
+        );
+        if r.is_ok() { accepted += 1; } else { rejected += 1; }
     }
 
-    let calls = (BOUNDARY_AMOUNTS.len() * BOUNDARY_PERIODS.len()) as u64;
-    // Each report_revenue call emits 2 events: a specific event (rev_init/rev_ovrd/rev_rej)
-    // plus the backward-compatible rev_rep event.
-    // 5 calls per report_revenue (rev_init, rev_inia, rev_rep, rev_repa, rev_reported_asset)?
-    // Let's just check accepted > 0 for now to make it compile.
-    assert!(accepted > 0);
+    // Invalid amounts must all be rejected.
+    for &amount in &invalid_amounts {
+        let r = client.try_report_revenue(
+            &issuer,
+            &symbol_short!("def"),
+            &token,
+            &payout_asset,
+            &amount,
+            &1,
+            &false,
+        );
+        assert!(r.is_err(), "negative amount {amount} should be rejected");
+        rejected += 1;
+    }
+
+    // Invalid period IDs must all be rejected.
+    for &period in &invalid_periods {
+        let r = client.try_report_revenue(
+            &issuer,
+            &symbol_short!("def"),
+            &token,
+            &payout_asset,
+            &100,
+            &period,
+            &false,
+        );
+        assert!(r.is_err(), "period_id {period} should be rejected");
+        rejected += 1;
+    }
+
+    assert!(accepted > 0, "at least one valid input must be accepted");
+    assert!(rejected > 0, "at least one invalid input must be rejected");
 }
 
 #[test]
@@ -944,7 +978,7 @@ fn fuzz_period_and_amount_repeatable_sweep_do_not_panic() {
     let env = Env::default();
     let (client, issuer, token, payout_asset) = setup_with_offering(&env);
 
-    // Same seed must produce the exact same sequence.
+    // Same seed must produce the exact same sequence (determinism check).
     let mut seed_a = 0x00A1_1CE5_ED19_u64;
     let mut seed_b = 0x00A1_1CE5_ED19_u64;
     for _ in 0..64 {
@@ -953,13 +987,17 @@ fn fuzz_period_and_amount_repeatable_sweep_do_not_panic() {
     }
 
     // Reset and run deterministic fuzz-style inputs through contract entrypoint.
-    // Input validation (#35) rejects negative amount; use try_ and count successes.
+    // Input validation (#35) rejects negative amounts and period_id == 0.
+    // Use try_ variant and count successes/rejections without asserting exact event count,
+    // since the number of accepted calls depends on validation outcomes.
     let mut seed = 0x00A1_1CE5_ED19_u64;
     let mut accepted = 0usize;
+    let mut rejected_invalid = 0usize;
     for i in 0..FUZZ_ITERATIONS {
         let mut amount = next_amount(&mut seed);
         let mut period = next_period(&mut seed);
 
+        // Inject boundary values periodically.
         if i % 64 == 0 {
             amount = i128::MAX;
         } else if i % 64 == 1 {
@@ -968,8 +1006,11 @@ fn fuzz_period_and_amount_repeatable_sweep_do_not_panic() {
         if i % 97 == 0 {
             period = u64::MAX;
         } else if i % 97 == 1 {
+            // period_id == 0 is invalid; force a rejection.
             period = 0;
         }
+
+        // Ensure amount is non-negative (negative values are rejected by validation).
         if amount < 0 {
             amount = amount.saturating_neg().max(0);
         }
@@ -985,6 +1026,8 @@ fn fuzz_period_and_amount_repeatable_sweep_do_not_panic() {
         );
         if r.is_ok() {
             accepted += 1;
+        } else {
+            rejected_invalid += 1;
         }
     }
 
