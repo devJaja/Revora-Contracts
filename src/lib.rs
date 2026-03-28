@@ -728,6 +728,9 @@ impl RevoraRevenueShare {
     }
 
     /// Input validation (#35): require period_id > 0 where 0 would be ambiguous.
+    ///
+    /// Period ID 0 is reserved and must not be used as a valid period identifier.
+    /// Valid period IDs are in the range [1, u64::MAX].
     fn require_valid_period_id(period_id: u64) -> Result<(), RevoraError> {
         if period_id == 0 {
             return Err(RevoraError::InvalidPeriodId);
@@ -1056,9 +1059,11 @@ impl RevoraRevenueShare {
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
         Self::require_not_paused(&env);
+        issuer.require_auth();
+
+        // Input validation (#35): reject invalid period_id and negative amounts early.
         Self::require_valid_period_id(period_id)?;
         Self::require_non_negative_amount(amount)?;
-        issuer.require_auth();
 
         let event_only = Self::is_event_only(&env);
         let offering_id = OfferingId {
@@ -2089,6 +2094,10 @@ impl RevoraRevenueShare {
         period_id: u64,
     ) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
+
+        // Input validation (#35): reject zero/invalid period_id and non-positive amounts.
+        Self::require_valid_period_id(period_id)?;
+        Self::require_positive_amount(amount)?;
 
         // Verify offering exists and issuer is current
         let current_issuer =
