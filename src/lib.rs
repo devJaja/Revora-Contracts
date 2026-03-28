@@ -40,8 +40,9 @@ pub enum RevoraError {
     /// Snapshot distribution is not enabled for this offering.
     SnapshotNotEnabled = 12,
     /// Provided snapshot reference is outdated or duplicates a previous one.
+    /// Overriding an existing revenue report.
     OutdatedSnapshot = 13,
-    /// Payout asset does not match the configured payout asset for this offering.
+    /// Payout asset mismatch.
     PayoutAssetMismatch = 14,
     /// A transfer is already pending for this offering.
     IssuerTransferPending = 15,
@@ -252,6 +253,14 @@ pub struct AuditSummary {
     pub total_revenue: i128,
     /// Total number of revenue reports submitted.
     pub report_count: u64,
+}
+
+/// Pending issuer transfer details including expiry tracking.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingTransfer {
+    pub new_issuer: Address,
+    pub timestamp: u64,
 }
 
 /// Cross-offering aggregated metrics (#39).
@@ -3572,12 +3581,20 @@ impl RevoraRevenueShare {
 
         // Check if transfer already pending
         let pending_key = DataKey::PendingIssuerTransfer(offering_id.clone());
-        if env.storage().persistent().has(&pending_key) {
-            return Err(RevoraError::IssuerTransferPending);
+        if let Some(pending) =
+            env.storage().persistent().get::<DataKey, PendingTransfer>(&pending_key)
+        {
+            let now = env.ledger().timestamp();
+            if now <= pending.timestamp.saturating_add(ISSUER_TRANSFER_EXPIRY_SECS) {
+                return Err(RevoraError::IssuerTransferPending);
+            }
+            // If expired, we implicitly allow overwriting
         }
 
-        // Store pending transfer
-        env.storage().persistent().set(&pending_key, &new_issuer);
+        // Store pending transfer with timestamp
+        let pending =
+            PendingTransfer { new_issuer: new_issuer.clone(), timestamp: env.ledger().timestamp() };
+        env.storage().persistent().set(&pending_key, &pending);
 
         env.events().publish(
             (EVENT_ISSUER_TRANSFER_PROPOSED, issuer, namespace, token),
@@ -3604,8 +3621,16 @@ impl RevoraRevenueShare {
 
         // Get pending transfer
         let pending_key = DataKey::PendingIssuerTransfer(offering_id.clone());
-        let new_issuer: Address =
+        let pending: PendingTransfer =
             env.storage().persistent().get(&pending_key).ok_or(RevoraError::NoTransferPending)?;
+
+        // Check for expiry
+        let now = env.ledger().timestamp();
+        if now > pending.timestamp.saturating_add(ISSUER_TRANSFER_EXPIRY_SECS) {
+            return Err(RevoraError::IssuerTransferExpired);
+        }
+
+        let new_issuer = pending.new_issuer;
 
         // Only the proposed new issuer can accept
         new_issuer.require_auth();
@@ -3772,8 +3797,10 @@ impl RevoraRevenueShare {
 
         // Check if transfer is pending
         let pending_key = DataKey::PendingIssuerTransfer(offering_id.clone());
-        let proposed_new_issuer: Address =
+        let pending: PendingTransfer =
             env.storage().persistent().get(&pending_key).ok_or(RevoraError::NoTransferPending)?;
+
+        let proposed_new_issuer = pending.new_issuer;
 
         // Clear pending transfer
         env.storage().persistent().remove(&pending_key);
@@ -3791,6 +3818,49 @@ impl RevoraRevenueShare {
         Ok(())
     }
 
+    /// Cleanup an expired issuer transfer proposal to free up storage.
+    /// Can be called by anyone if the transfer has expired.
+    pub fn cleanup_expired_transfer(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+    ) -> Result<(), RevoraError> {
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+        let pending_key = DataKey::PendingIssuerTransfer(offering_id.clone());
+        let pending: PendingTransfer =
+            env.storage().persistent().get(&pending_key).ok_or(RevoraError::NoTransferPending)?;
+
+        let now = env.ledger().timestamp();
+        if now <= pending.timestamp.saturating_add(ISSUER_TRANSFER_EXPIRY_SECS) {
+            // Not expired yet - only issuer can cancel via cancel_issuer_transfer
+            return Err(RevoraError::NotAuthorized);
+        }
+
+        env.storage().persistent().remove(&pending_key);
+
+        // Get current issuer for event
+        let current_issuer =
+            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+                .unwrap_or(pending.new_issuer.clone());
+
+        env.events().publish(
+            (
+                EVENT_ISSUER_TRANSFER_CANCELLED,
+                offering_id.issuer,
+                offering_id.namespace,
+                offering_id.token,
+            ),
+            (current_issuer, pending.new_issuer),
+        );
+
+        Ok(())
+    }
+
     /// Get the pending issuer transfer for an offering, if any.
     pub fn get_pending_issuer_transfer(
         env: Env,
@@ -3800,7 +3870,15 @@ impl RevoraRevenueShare {
     ) -> Option<Address> {
         let offering_id = OfferingId { issuer, namespace, token };
         let pending_key = DataKey::PendingIssuerTransfer(offering_id);
-        env.storage().persistent().get(&pending_key)
+        if let Some(pending) =
+            env.storage().persistent().get::<DataKey, PendingTransfer>(&pending_key)
+        {
+            let now = env.ledger().timestamp();
+            if now <= pending.timestamp.saturating_add(ISSUER_TRANSFER_EXPIRY_SECS) {
+                return Some(pending.new_issuer);
+            }
+        }
+        None
     }
 
     // ── Revenue distribution calculation ───────────────────────────

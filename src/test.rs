@@ -8056,18 +8056,12 @@ mod scenarios {
         client.set_holder_share(&issuer, &symbol_short!("def"), &token, &investor_b, &80); // 80%
 
         // 6. Investor A claims all available periods (1 and 2)
-        // expected_payout_a_p1 = 500,000 * 60 / 100 = 300,000
-        // expected_payout_a_p2 = 1,000,000 * 20 / 100 = 200,000
-        // total = 500,000
         let claimable_a = client.get_claimable(&issuer, &symbol_short!("def"), &token, &investor_a);
         assert_eq!(claimable_a, 500_000);
         let payout_a = client.claim(&investor_a, &issuer, &symbol_short!("def"), &token, &0);
         assert_eq!(payout_a, 500_000);
 
         // 7. Investor B claims all available periods
-        // expected_payout_b_p1 = 500,000 * 40 / 100 = 200,000
-        // expected_payout_b_p2 = 1,000,000 * 80 / 100 = 800,000
-        // total = 1,000,000
         let claimable_b = client.get_claimable(&issuer, &symbol_short!("def"), &token, &investor_b);
         assert_eq!(claimable_b, 1_000_000);
         let payout_b = client.claim(&investor_b, &issuer, &symbol_short!("def"), &token, &0);
