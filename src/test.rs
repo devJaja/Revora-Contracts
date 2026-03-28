@@ -1347,7 +1347,7 @@ fn add_marks_investor_as_blacklisted() {
     let investor = Address::generate(&env);
 
     assert!(!client.is_blacklisted(&issuer, &symbol_short!("def"), &token, &investor));
-    client.blacklist_add(&admin, &issuer, &symbol_short!("def"), &token, &investor);
+    client.blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &investor);
     assert!(client.is_blacklisted(&issuer, &symbol_short!("def"), &token, &investor));
 }
 
@@ -1356,8 +1356,8 @@ fn remove_unmarks_investor() {
     let (env, client, admin, issuer, token) = blacklist_setup();
     let investor = Address::generate(&env);
 
-    client.blacklist_add(&admin, &issuer, &symbol_short!("def"), &token, &investor);
-    client.blacklist_remove(&admin, &issuer, &symbol_short!("def"), &token, &investor);
+    client.blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &investor);
+    client.blacklist_remove(&issuer, &issuer, &symbol_short!("def"), &token, &investor);
     assert!(!client.is_blacklisted(&issuer, &symbol_short!("def"), &token, &investor));
 }
 
@@ -1368,9 +1368,9 @@ fn get_blacklist_returns_all_blocked_investors() {
     let inv_b = Address::generate(&env);
     let inv_c = Address::generate(&env);
 
-    client.blacklist_add(&admin, &issuer, &symbol_short!("def"), &token, &inv_a);
-    client.blacklist_add(&admin, &issuer, &symbol_short!("def"), &token, &inv_b);
-    client.blacklist_add(&admin, &issuer, &symbol_short!("def"), &token, &inv_c);
+    client.blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &inv_a);
+    client.blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &inv_b);
+    client.blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &inv_c);
 
     let list = client.get_blacklist(&issuer, &symbol_short!("def"), &token);
     assert_eq!(list.len(), 3);
@@ -1397,8 +1397,8 @@ fn double_add_is_idempotent() {
     let (env, client, admin, issuer, token) = blacklist_setup();
     let investor = Address::generate(&env);
 
-    client.blacklist_add(&admin, &issuer, &symbol_short!("def"), &token, &investor);
-    client.blacklist_add(&admin, &issuer, &symbol_short!("def"), &token, &investor);
+    client.blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &investor);
+    client.blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &investor);
 
     assert_eq!(client.get_blacklist(&issuer, &symbol_short!("def"), &token).len(), 1);
 }
@@ -1408,7 +1408,7 @@ fn remove_nonexistent_is_idempotent() {
     let (env, client, admin, issuer, token) = blacklist_setup();
     let investor = Address::generate(&env);
 
-    client.blacklist_remove(&admin, &issuer, &symbol_short!("def"), &token, &investor); // must not panic
+    client.blacklist_remove(&issuer, &issuer, &symbol_short!("def"), &token, &investor); // must not panic
     assert!(!client.is_blacklisted(&issuer, &symbol_short!("def"), &token, &investor));
 }
 
@@ -1452,7 +1452,7 @@ fn blacklist_add_emits_event() {
     let investor = Address::generate(&env);
 
     let before = env.events().all().len();
-    client.blacklist_add(&admin, &issuer, &symbol_short!("def"), &token, &investor);
+    client.blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &investor);
     assert!(env.events().all().len() > before);
 }
 
@@ -1461,9 +1461,9 @@ fn blacklist_remove_emits_event() {
     let (env, client, admin, issuer, token) = blacklist_setup();
     let investor = Address::generate(&env);
 
-    client.blacklist_add(&admin, &issuer, &symbol_short!("def"), &token, &investor);
+    client.blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &investor);
     let before = env.events().all().len();
-    client.blacklist_remove(&admin, &issuer, &symbol_short!("def"), &token, &investor);
+    client.blacklist_remove(&issuer, &issuer, &symbol_short!("def"), &token, &investor);
     assert!(env.events().all().len() > before);
 }
 
@@ -1475,7 +1475,7 @@ fn blacklisted_investor_excluded_from_distribution_filter() {
     let allowed = Address::generate(&env);
     let blocked = Address::generate(&env);
 
-    client.blacklist_add(&admin, &issuer, &symbol_short!("def"), &token, &blocked);
+    client.blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &blocked);
 
     let investors = [allowed.clone(), blocked.clone()];
     let eligible = investors
@@ -1491,7 +1491,7 @@ fn blacklist_takes_precedence_over_whitelist() {
     let (env, client, admin, issuer, token) = blacklist_setup();
     let investor = Address::generate(&env);
 
-    client.blacklist_add(&admin, &issuer, &symbol_short!("def"), &token, &investor);
+    client.blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &investor);
 
     // Even if investor were on a whitelist, blacklist must win
     assert!(client.is_blacklisted(&issuer, &symbol_short!("def"), &token, &investor));
@@ -1528,6 +1528,63 @@ fn blacklist_remove_requires_auth() {
     let r =
         client.try_blacklist_remove(&bad_actor, &issuer, &symbol_short!("def"), &token, &investor);
     assert!(r.is_err());
+}
+
+#[test]
+fn blacklist_add_requires_issuer_auth() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let admin = Address::generate(&env);
+    let issuer = Address::generate(&env); // different from admin
+    let non_issuer = Address::generate(&env);
+
+    let token = Address::generate(&env);
+    let investor = Address::generate(&env);
+
+    // Non-issuer cannot add to blacklist
+    let r = client.try_blacklist_add(&non_issuer, &issuer, &symbol_short!("def"), &token, &investor);
+    assert!(r.is_err());
+    assert_eq!(r.unwrap_err(), RevoraError::NotAuthorized);
+
+    // Admin cannot add to blacklist if not issuer
+    let r = client.try_blacklist_add(&admin, &issuer, &symbol_short!("def"), &token, &investor);
+    assert!(r.is_err());
+    assert_eq!(r.unwrap_err(), &RevoraError::NotAuthorized);
+
+    // Issuer can add
+    let r = client.try_blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &investor);
+    assert!(r.is_ok());
+}
+
+#[test]
+fn blacklist_remove_requires_issuer_auth() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = make_client(&env);
+    let admin = Address::generate(&env);
+    let issuer = Address::generate(&env); // different from admin
+    let non_issuer = Address::generate(&env);
+
+    let token = Address::generate(&env);
+    let investor = Address::generate(&env);
+
+    // First add with issuer
+    client.blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &investor);
+
+    // Non-issuer cannot remove
+    let r = client.try_blacklist_remove(&non_issuer, &issuer, &symbol_short!("def"), &token, &investor);
+    assert!(r.is_err());
+    assert_eq!(r.unwrap_err(), RevoraError::NotAuthorized);
+
+    // Admin cannot remove if not issuer
+    let r = client.try_blacklist_remove(&admin, &issuer, &symbol_short!("def"), &token, &investor);
+    assert!(r.is_err());
+    assert_eq!(r.unwrap_err(), RevoraError::NotAuthorized);
+
+    // Issuer can remove
+    let r = client.try_blacklist_remove(&issuer, &issuer, &symbol_short!("def"), &token, &investor);
+    assert!(r.is_ok());
 }
 
 // ── whitelist CRUD ────────────────────────────────────────────
@@ -1811,8 +1868,8 @@ fn blacklist_overrides_whitelist() {
     client.register_offering(&issuer, &symbol_short!("def"), &token, &1_000, &payout_asset, &0);
 
     // Add to both whitelist and blacklist
-    client.whitelist_add(&admin, &issuer, &symbol_short!("def"), &token, &investor);
-    client.blacklist_add(&admin, &issuer, &symbol_short!("def"), &token, &investor);
+    client.whitelist_add(&issuer, &issuer, &symbol_short!("def"), &token, &investor);
+    client.blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &investor);
 
     // Blacklist must take precedence
     let whitelist_enabled = client.is_whitelist_enabled(&issuer, &symbol_short!("def"), &token);
@@ -2150,7 +2207,7 @@ fn gas_characterization_report_revenue_with_large_blacklist() {
     let issuer = admin.clone();
 
     env.mock_all_auths();
-    client.blacklist_add(&admin, &issuer, &symbol_short!("def"), &token, &Address::generate(&env));
+    client.blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &Address::generate(&env));
 
     client.report_revenue(
         &issuer,
@@ -5507,10 +5564,10 @@ fn testnet_mode_blacklist_operations_unaffected() {
     client.set_testnet_mode(&true);
 
     // Blacklist operations should work normally
-    client.blacklist_add(&admin, &issuer, &symbol_short!("def"), &token, &investor);
+    client.blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &investor);
     assert!(client.is_blacklisted(&issuer, &symbol_short!("def"), &token, &investor));
 
-    client.blacklist_remove(&admin, &issuer, &symbol_short!("def"), &token, &investor);
+    client.blacklist_remove(&issuer, &issuer, &symbol_short!("def"), &token, &investor);
     assert!(!client.is_blacklisted(&issuer, &symbol_short!("def"), &token, &investor));
 }
 
@@ -7693,9 +7750,9 @@ mod regression {
         let a = Address::generate(&env);
         let b = Address::generate(&env);
         let c = Address::generate(&env);
-        client.blacklist_add(&admin, &issuer, &symbol_short!("def"), &token, &a);
-        client.blacklist_add(&admin, &issuer, &symbol_short!("def"), &token, &b);
-        client.blacklist_add(&admin, &issuer, &symbol_short!("def"), &token, &c);
+        client.blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &a);
+        client.blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &b);
+        client.blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &c);
         let list = client.get_blacklist(&issuer, &symbol_short!("def"), &token);
         assert_eq!(list.len(), 3);
         assert_eq!(list.get(0).unwrap(), a);
@@ -7717,10 +7774,10 @@ mod regression {
         let a = Address::generate(&env);
         let b = Address::generate(&env);
         let c = Address::generate(&env);
-        client.blacklist_add(&admin, &issuer, &symbol_short!("def"), &token, &a);
-        client.blacklist_add(&admin, &issuer, &symbol_short!("def"), &token, &b);
-        client.blacklist_add(&admin, &issuer, &symbol_short!("def"), &token, &c);
-        client.blacklist_remove(&admin, &issuer, &symbol_short!("def"), &token, &b);
+        client.blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &a);
+        client.blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &b);
+        client.blacklist_add(&issuer, &issuer, &symbol_short!("def"), &token, &c);
+        client.blacklist_remove(&issuer, &issuer, &symbol_short!("def"), &token, &b);
         let list = client.get_blacklist(&issuer, &symbol_short!("def"), &token);
         assert_eq!(list.len(), 2);
         assert_eq!(list.get(0).unwrap(), a);

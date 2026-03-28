@@ -1819,13 +1819,14 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
     /// This operation is idempotent.
     ///
     /// ### Parameters
-    /// - `caller`: The address authorized to manage the blacklist. Must provide authentication.
+    /// - `caller`: The address authorized to manage the blacklist. Must be the current issuer of the offering.
     /// - `token`: The token representing the offering.
     /// - `investor`: The address to be blacklisted.
     ///
     /// ### Returns
     /// - `Ok(())` on success.
     /// - `Err(RevoraError::ContractFrozen)` if the contract is frozen.
+    /// - `Err(RevoraError::NotAuthorized)` if caller is not the current issuer.
     pub fn blacklist_add(
         env: Env,
         caller: Address,
@@ -1880,13 +1881,14 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
     /// This operation is idempotent.
     ///
     /// ### Parameters
-    /// - `caller`: The address authorized to manage the blacklist. Must provide authentication.
+    /// - `caller`: The address authorized to manage the blacklist. Must be the current issuer of the offering.
     /// - `token`: The token representing the offering.
     /// - `investor`: The address to be removed from the blacklist.
     ///
     /// ### Returns
     /// - `Ok(())` on success.
     /// - `Err(RevoraError::ContractFrozen)` if the contract is frozen.
+    /// - `Err(RevoraError::NotAuthorized)` if caller is not the current issuer.
     pub fn blacklist_remove(
         env: Env,
         caller: Address,
