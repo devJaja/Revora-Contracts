@@ -1854,21 +1854,29 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
             return Err(RevoraError::NotAuthorized);
         }
 
-        let key = DataKey::Blacklist(offering_id.clone());
-        let mut map: Map<Address, bool> =
-            env.storage().persistent().get(&key).unwrap_or_else(|| Map::new(&env));
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
 
-        let was_present = map.get(investor.clone()).unwrap_or(false);
-        map.set(investor.clone(), true);
-        env.storage().persistent().set(&key, &map);
+        if !Self::is_event_only(&env) {
+            let key = DataKey::Blacklist(offering_id.clone());
+            let mut map: Map<Address, bool> =
+                env.storage().persistent().get(&key).unwrap_or_else(|| Map::new(&env));
 
-        // Maintain insertion order for deterministic get_blacklist (#38)
-        if !was_present {
-            let order_key = DataKey::BlacklistOrder(offering_id.clone());
-            let mut order: Vec<Address> =
-                env.storage().persistent().get(&order_key).unwrap_or_else(|| Vec::new(&env));
-            order.push_back(investor.clone());
-            env.storage().persistent().set(&order_key, &order);
+            let was_present = map.get(investor.clone()).unwrap_or(false);
+            if !was_present {
+                map.set(investor.clone(), true);
+                env.storage().persistent().set(&key, &map);
+
+                // Maintain insertion order for deterministic get_blacklist (#38)
+                let order_key = DataKey::BlacklistOrder(offering_id.clone());
+                let mut order: Vec<Address> =
+                    env.storage().persistent().get(&order_key).unwrap_or_else(|| Vec::new(&env));
+                order.push_back(investor.clone());
+                env.storage().persistent().set(&order_key, &order);
+            }
         }
 
         env.events().publish((EVENT_BL_ADD, issuer, namespace, token), (caller, investor));
@@ -1884,6 +1892,10 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
     /// - `caller`: The address authorized to manage the blacklist. Must be the current issuer of the offering.
     /// - `token`: The token representing the offering.
     /// - `investor`: The address to be removed from the blacklist.
+    ///
+    /// ### Security Assumptions
+    /// - `caller` must be the current issuer of the offering or the contract admin.
+    /// - `namespace` isolation ensures that removing from one blacklist does not affect others.
     ///
     /// ### Returns
     /// - `Ok(())` on success.
@@ -1973,7 +1985,14 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
     /// Idempotent — calling with an already-whitelisted address is safe.
     /// When a whitelist exists (non-empty), only whitelisted addresses
     /// are eligible for revenue distribution (subject to blacklist override).
-    /// Add `investor` to the per-offering whitelist.
+    /// ### Security Assumptions
+    /// - `caller` must be the current issuer of the offering.
+    /// - `namespace` partitioning prevents whitelists from leaking across tenants.
+    ///
+    /// ### Returns
+    /// - `Ok(())` on success.
+    /// - `Err(RevoraError::OfferingNotFound)` if the offering is not registered.
+    /// - `Err(RevoraError::NotAuthorized)` if the caller is not authorized.
     pub fn whitelist_add(
         env: Env,
         caller: Address,
@@ -1985,6 +2004,8 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
         Self::require_not_frozen(&env)?;
         Self::require_not_paused(&env);
         caller.require_auth();
+
+        // Verify offering exists and get current issuer for auth check
         let current_issuer =
             Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
                 .ok_or(RevoraError::OfferingNotFound)?;
@@ -2000,8 +2021,10 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
         let mut map: Map<Address, bool> =
             env.storage().persistent().get(&key).unwrap_or_else(|| Map::new(&env));
 
-        map.set(investor.clone(), true);
-        env.storage().persistent().set(&key, &map);
+        if !Self::is_event_only(&env) {
+            let key = DataKey::Whitelist(offering_id.clone());
+            let mut map: Map<Address, bool> =
+                env.storage().persistent().get(&key).unwrap_or_else(|| Map::new(&env));
 
         env.events().publish(
             (
@@ -2030,6 +2053,8 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
         Self::require_not_frozen(&env)?;
         Self::require_not_paused(&env);
         caller.require_auth();
+
+        // Verify offering exists and get current issuer for auth check
         let current_issuer =
             Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
                 .ok_or(RevoraError::OfferingNotFound)?;
@@ -2045,8 +2070,15 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
         let mut map: Map<Address, bool> =
             env.storage().persistent().get(&key).unwrap_or_else(|| Map::new(&env));
 
-        map.remove(investor.clone());
-        env.storage().persistent().set(&key, &map);
+        if !Self::is_event_only(&env) {
+            let key = DataKey::Whitelist(offering_id.clone());
+            if let Some(mut map) = env.storage().persistent().get::<DataKey, Map<Address, bool>>(&key)
+            {
+                if map.remove(investor.clone()).is_some() {
+                    env.storage().persistent().set(&key, &map);
+                }
+            }
+        }
 
         env.events().publish(
             (
@@ -2203,19 +2235,20 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
             token: token.clone(),
         };
 
-        // Verify offering exists and issuer is current
+        // Verify offering exists and get current issuer for auth check
         let current_issuer =
             Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
                 .ok_or(RevoraError::OfferingNotFound)?;
 
         if current_issuer != issuer {
-            return Err(RevoraError::OfferingNotFound);
+            return Err(RevoraError::NotAuthorized);
         }
 
-        if !Self::is_event_only(&env) {
-            let curr_key = DataKey::CurrentConcentration(offering_id.clone());
-            env.storage().persistent().set(&curr_key, &concentration_bps);
-        }
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
 
         let limit_key = DataKey::ConcentrationLimit(offering_id);
         if let Some(config) =

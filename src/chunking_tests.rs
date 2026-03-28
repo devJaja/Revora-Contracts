@@ -1,3 +1,4 @@
+#![cfg(test)]
 #![allow(dead_code, unused_variables, unused_imports)]
 
 use crate::{RevoraRevenueShare, RevoraRevenueShareClient};
@@ -12,7 +13,7 @@ fn make_client(env: &Env) -> RevoraRevenueShareClient {
 fn setup() -> (Env, RevoraRevenueShareClient, Address) {
     let env = Env::default();
     env.mock_all_auths();
-    let contract_id = env.register_contract(None, RevoraRevenueShare);
+    let contract_id = env.register_contract(None, crate::RevoraRevenueShare);
     let client = RevoraRevenueShareClient::new(&env, &contract_id);
     let issuer = Address::generate(&env);
     (env, client, issuer)
