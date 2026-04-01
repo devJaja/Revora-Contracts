@@ -3557,6 +3557,13 @@ impl RevoraRevenueShare {
         let delay_secs: u64 = env.storage().persistent().get(&delay_key).unwrap_or(0);
         let now = env.ledger().timestamp();
 
+        // Claim-after-cancel: read the cancellation timestamp once (None = active offering).
+        // Periods deposited after this timestamp are skipped; pre-cancel periods are claimable.
+        let cancelled_at: Option<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OfferingCancelledAt(offering_id.clone()));
+
         let mut total_payout: i128 = 0;
         let mut claimed_periods = Vec::new(&env);
         let mut last_claimed_idx = start_idx;
@@ -3566,6 +3573,17 @@ impl RevoraRevenueShare {
             let period_id: u64 = env.storage().persistent().get(&entry_key).unwrap();
             let time_key = DataKey::PeriodDepositTime(offering_id.clone(), period_id);
             let deposit_time: u64 = env.storage().persistent().get(&time_key).unwrap_or(0);
+
+            // Claim-after-cancel: skip (and advance past) any period deposited after cancellation.
+            // This is a defensive guard; in practice deposit_revenue already blocks post-cancel
+            // deposits, so this branch should never be taken on a well-formed chain.
+            if let Some(ts) = cancelled_at {
+                if deposit_time > ts {
+                    last_claimed_idx = i + 1;
+                    continue;
+                }
+            }
+
             if delay_secs > 0 && now < deposit_time.saturating_add(delay_secs) {
                 break;
             }
