@@ -1,6 +1,7 @@
 #![no_std]
 #![deny(unsafe_code)]
 #![deny(clippy::dbg_macro, clippy::todo, clippy::unimplemented)]
+extern crate alloc;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, xdr::ToXdr, Address,
     BytesN, Env, Map, String, Symbol, Vec,
@@ -183,6 +184,24 @@ pub enum RevoraError {
     SignerKeyNotRegistered = 29,
     /// Cross-contract token transfer failed.
     TransferFailed = 30,
+    /// Clippy/format gate policy is invalid.
+    GatePolicyInvalid = 31,
+    /// Clippy/format attestation is expired or from the future.
+    GateAttestationExpired = 32,
+    /// Clippy/format gate requirements are not satisfied.
+    GateCheckFailed = 33,
+    /// Contract is paused; state-changing operations are disabled until unpaused.
+    ContractPaused = 34,
+    /// Pending issuer transfer proposal has expired.
+    IssuerTransferExpired = 35,
+    /// An admin rotation proposal is already pending.
+    AdminRotationPending = 36,
+    /// No admin rotation proposal is currently pending.
+    NoAdminRotationPending = 37,
+    /// Caller is not authorized to accept the pending admin rotation.
+    UnauthorizedRotationAccept = 38,
+    /// Proposed admin matches the current admin.
+    AdminRotationSameAddress = 39,
 }
 
 // ── Event symbols ────────────────────────────────────────────
@@ -234,7 +253,6 @@ const EVENT_PROPOSAL_EXECUTED: Symbol = symbol_short!("prop_exe");
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
-#[derive(proptest::prelude::Arbitrary)]
 pub enum ProposalAction {
     SetAdmin(Address),
     Freeze,
@@ -242,7 +260,6 @@ pub enum ProposalAction {
     AddOwner(Address),
     RemoveOwner(Address),
 }
-
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -294,6 +311,8 @@ const EVENT_META_SHARE_SET: Symbol = symbol_short!("meta_shr");
 const EVENT_META_REV_APPROVE: Symbol = symbol_short!("meta_rev");
 /// Emitted when `repair_audit_summary` writes a corrected `AuditSummary` to storage.
 const EVENT_AUDIT_REPAIRED: Symbol = symbol_short!("aud_rep");
+const EVENT_GATE_CONFIG_SET: Symbol = symbol_short!("gate_cfg");
+const EVENT_GATE_ATTESTED: Symbol = symbol_short!("gate_att");
 
 /// Current schema for `EVENT_INDEXED_V2` topics.
 const INDEXER_EVENT_SCHEMA_VERSION: u32 = 2;
@@ -370,6 +389,17 @@ pub struct AuditSummary {
     pub total_revenue: i128,
     /// Total number of revenue reports submitted.
     pub report_count: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuditReconciliationResult {
+    pub stored_total_revenue: i128,
+    pub stored_report_count: u64,
+    pub computed_total_revenue: i128,
+    pub computed_report_count: u64,
+    pub is_consistent: bool,
+    pub is_saturated: bool,
 }
 
 /// Pending issuer transfer details including expiry tracking.
@@ -460,6 +490,39 @@ pub struct MetaRevenueApprovalPayload {
 pub struct AccessWindow {
     pub start_timestamp: u64,
     pub end_timestamp: u64,
+}
+
+/// Per-offering policy for clippy/format gate enforcement.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClippyFormatGateConfig {
+    /// If true, state-changing revenue flows require a fresh green attestation.
+    pub enforce: bool,
+    /// Maximum attestation age in seconds.
+    pub max_attestation_age_secs: u64,
+}
+
+/// Per-offering attestation proving recent format and clippy pass status.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClippyFormatGateAttestation {
+    /// Ledger timestamp when attestation was recorded.
+    pub attested_at: u64,
+    /// True when formatter gate passed.
+    pub format_ok: bool,
+    /// True when clippy gate passed.
+    pub clippy_ok: bool,
+    /// 32-byte artifact hash tying attestation to a build/test artifact.
+    pub artifact_hash: BytesN<32>,
+}
+
+/// Payload for recording a clippy/format gate attestation.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClippyFormatGateAttestationInput {
+    pub format_ok: bool,
+    pub clippy_ok: bool,
+    pub artifact_hash: BytesN<32>,
 }
 
 #[contracttype]
@@ -609,13 +672,15 @@ pub enum DataKey {
     /// Global pause flag; when true, state-mutating ops are disabled (#7).
     Paused,
 
-
-
     /// Configuration flag: when true, contract is event-only (no persistent business state).
     EventOnlyMode,
 
     /// Metadata reference (IPFS hash, HTTPS URI, etc.) for an offering.
     OfferingMetadata(OfferingId),
+    /// Per-offering clippy/format gate policy.
+    ClippyFormatGateConfig(OfferingId),
+    /// Per-offering clippy/format gate attestation.
+    ClippyFormatGateAttestation(OfferingId),
     /// Platform fee in basis points (max 5000 = 50%) taken from reported revenue (#6).
     PlatformFeeBps,
     /// Per-offering per-asset fee override (#98).
@@ -893,8 +958,7 @@ pub struct RevoraRevenueShare;
 #[contractimpl]
 impl RevoraRevenueShare {
     const META_AUTH_VERSION: u32 = 1;
-
-
+    const MAX_GATE_ATTESTATION_AGE_SECS: u64 = 30 * 24 * 60 * 60;
 
     /// Returns error if contract is frozen (#32). Call at start of state-mutating entrypoints.
     fn require_not_frozen(env: &Env) -> Result<(), RevoraError> {
@@ -903,6 +967,14 @@ impl RevoraRevenueShare {
             return Err(RevoraError::ContractFrozen);
         }
         Ok(())
+    }
+
+    /// Returns the admin address or `Err(NotInitialized)` when `DataKey::Admin` is absent.
+    fn require_admin(env: &Env) -> Result<Address, RevoraError> {
+        env.storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .ok_or(RevoraError::NotInitialized)
     }
 
     /// Helper to emit deterministic v2 versioned events for core event versioning.
@@ -1040,6 +1112,38 @@ impl RevoraRevenueShare {
         Ok(offering.payout_asset)
     }
 
+    fn require_clippy_format_gate(env: &Env, offering_id: &OfferingId) -> Result<(), RevoraError> {
+        let policy_key = DataKey::ClippyFormatGateConfig(offering_id.clone());
+        let policy: ClippyFormatGateConfig = match env.storage().persistent().get(&policy_key) {
+            Some(cfg) => cfg,
+            None => return Ok(()),
+        };
+
+        if !policy.enforce {
+            return Ok(());
+        }
+
+        let attestation_key = DataKey::ClippyFormatGateAttestation(offering_id.clone());
+        let attestation: ClippyFormatGateAttestation =
+            env.storage().persistent().get(&attestation_key).ok_or(RevoraError::GateCheckFailed)?;
+
+        if !attestation.format_ok || !attestation.clippy_ok {
+            return Err(RevoraError::GateCheckFailed);
+        }
+
+        let now = env.ledger().timestamp();
+        if now < attestation.attested_at {
+            return Err(RevoraError::GateAttestationExpired);
+        }
+
+        let age = now.saturating_sub(attestation.attested_at);
+        if age > policy.max_attestation_age_secs {
+            return Err(RevoraError::GateAttestationExpired);
+        }
+
+        Ok(())
+    }
+
     /// Internal helper for revenue deposits.
     /// Validates amount using the Negative Amount Validation Matrix (#163).
     fn do_deposit_revenue(
@@ -1071,6 +1175,8 @@ impl RevoraRevenueShare {
         // Validate inputs (#35)
         Self::require_valid_period_id(period_id)?;
         Self::require_positive_amount(amount)?;
+        Self::require_clippy_format_gate(env, &offering_id)?;
+        Self::require_clippy_format_gate(env, &offering_id)?;
 
         // Verify offering exists
         if Self::get_offering(env.clone(), issuer.clone(), namespace.clone(), token.clone())
@@ -1081,7 +1187,6 @@ impl RevoraRevenueShare {
 
         // Enforce period ordering invariant (double-check at deposit)
         Self::require_next_period_id(env, &offering_id, period_id)?;
-
 
         // Check period not already deposited
         let rev_key = DataKey::PeriodRevenue(offering_id.clone(), period_id);
@@ -1115,7 +1220,10 @@ impl RevoraRevenueShare {
 
         // Transfer tokens from issuer to contract
         let contract_addr = env.current_contract_address();
-        if token::Client::new(env, &payment_token).try_transfer(&issuer, &contract_addr, &amount).is_err() {
+        if token::Client::new(env, &payment_token)
+            .try_transfer(&issuer, &contract_addr, &amount)
+            .is_err()
+        {
             return Err(RevoraError::TransferFailed);
         }
 
@@ -1152,7 +1260,7 @@ impl RevoraRevenueShare {
         Self::emit_v2_event(
             env,
             (EVENT_REV_DEPOSIT_V2, issuer.clone(), namespace.clone(), token.clone()),
-            (payment_token, amount, period_id)
+            (payment_token, amount, period_id),
         );
         Ok(())
     }
@@ -1165,11 +1273,8 @@ impl RevoraRevenueShare {
 
     /// Return true if the contract is in event-only mode.
     pub fn is_event_only(env: &Env) -> bool {
-        let (_, event_only): (bool, bool) = env
-            .storage()
-            .persistent()
-            .get(&DataKey::ContractFlags)
-            .unwrap_or((false, false));
+        let (_, event_only): (bool, bool) =
+            env.storage().persistent().get(&DataKey::ContractFlags).unwrap_or((false, false));
         event_only
     }
 
@@ -1182,21 +1287,24 @@ impl RevoraRevenueShare {
         Ok(())
     }
 
-/// Require period_id is valid next in strictly increasing sequence for offering.
-/// Panics if offering not found.
-fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -> Result<(), RevoraError> {
-    if period_id == 0 {
-        return Err(RevoraError::InvalidPeriodId);
+    /// Require period_id is valid next in strictly increasing sequence for offering.
+    /// Panics if offering not found.
+    fn require_next_period_id(
+        env: &Env,
+        offering_id: &OfferingId,
+        period_id: u64,
+    ) -> Result<(), RevoraError> {
+        if period_id == 0 {
+            return Err(RevoraError::InvalidPeriodId);
+        }
+        let key = DataKey::LastPeriodId(offering_id.clone());
+        let last: u64 = env.storage().persistent().get(&key).unwrap_or(0);
+        if period_id <= last {
+            return Err(RevoraError::InvalidPeriodId);
+        }
+        env.storage().persistent().set(&key, &period_id);
+        Ok(())
     }
-    let key = DataKey::LastPeriodId(offering_id.clone());
-    let last: u64 = env.storage().persistent().get(&key).unwrap_or(0);
-    if period_id <= last {
-        return Err(RevoraError::InvalidPeriodId);
-    }
-    env.storage().persistent().set(&key, &period_id);
-    Ok(())
-}
-
 
     /// Initialize the contract with an admin and an optional safety role.
     ///
@@ -1386,10 +1494,7 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
             env.storage().persistent().set(&ns_reg_key, &true);
         }
 
-        let tenant_id = TenantId {
-            issuer: issuer.clone(),
-            namespace: namespace.clone(),
-        };
+        let tenant_id = TenantId { issuer: issuer.clone(), namespace: namespace.clone() };
         let count_key = DataKey::OfferCount(tenant_id.clone());
         let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
 
@@ -1417,41 +1522,35 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
             let cap_key = DataKey::SupplyCap(offering_id);
             env.storage().persistent().set(&cap_key, &supply_cap);
         }
-    }
 
-    env.events().publish(
-        (symbol_short!("offer_reg"), issuer.clone(), namespace.clone()),
-        (token.clone(), revenue_share_bps, payout_asset.clone()),
-    );
-    env.events().publish(
-        (
-            EVENT_INDEXED_V2,
-            EventIndexTopicV2 {
-                version: 2,
-                event_type: EVENT_TYPE_OFFER,
-                issuer: issuer.clone(),
-                namespace: namespace.clone(),
-                token: token.clone(),
-                period_id: 0,
-            },
-        ),
-        (revenue_share_bps, payout_asset.clone()),
-    );
-
-    if Self::is_event_versioning_enabled(env.clone()) {
         env.events().publish(
-            (EVENT_OFFER_REG_V1, issuer.clone(), namespace.clone()),
-            (
-                EVENT_SCHEMA_VERSION,
-                token.clone(),
-                revenue_share_bps,
-                payout_asset.clone(),
-            ),
+            (symbol_short!("offer_reg"), issuer.clone(), namespace.clone()),
+            (token.clone(), revenue_share_bps, payout_asset.clone()),
         );
-    }
+        env.events().publish(
+            (
+                EVENT_INDEXED_V2,
+                EventIndexTopicV2 {
+                    version: 2,
+                    event_type: EVENT_TYPE_OFFER,
+                    issuer: issuer.clone(),
+                    namespace: namespace.clone(),
+                    token: token.clone(),
+                    period_id: 0,
+                },
+            ),
+            (revenue_share_bps, payout_asset.clone()),
+        );
 
-    Ok(())
-}
+        if Self::is_event_versioning_enabled(env.clone()) {
+            env.events().publish(
+                (EVENT_OFFER_REG_V1, issuer.clone(), namespace.clone()),
+                (EVENT_SCHEMA_VERSION, token.clone(), revenue_share_bps, payout_asset.clone()),
+            );
+        }
+
+        Ok(())
+    }
 
     /// Fetch a single offering by issuer and token.
     ///
@@ -1570,6 +1669,8 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
                 return Err(RevoraError::OfferingNotFound);
             }
 
+            Self::require_clippy_format_gate(&env, &offering_id)?;
+
             let offering =
                 Self::get_offering(env.clone(), issuer.clone(), namespace.clone(), token.clone())
                     .ok_or(RevoraError::OfferingNotFound)?;
@@ -1595,7 +1696,6 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
                 }
             }
         }
-
 
         let blacklist = if event_only {
             Vec::new(&env)
@@ -1800,19 +1900,6 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
             (payout_asset.clone(), amount, period_id),
         );
 
-        // Audit log summary (#34): maintain per-offering total revenue and report count
-        // only for persisted reports. Event-only mode should not mutate summary state.
-        if !event_only {
-            let summary_key = DataKey::AuditSummary(offering_id.clone());
-            let mut summary: AuditSummary = env
-                .storage()
-                .persistent()
-                .get(&summary_key)
-                .unwrap_or(AuditSummary { total_revenue: 0, report_count: 0 });
-            summary.total_revenue = summary.total_revenue.saturating_add(amount);
-            summary.report_count = summary.report_count.saturating_add(1);
-            env.storage().persistent().set(&summary_key, &summary);
-        }
         // Optionally emit versioned v1 events for forward-compatible consumers
         if Self::is_event_versioning_enabled(env.clone()) {
             env.events().publish(
@@ -1820,26 +1907,82 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
                 (EVENT_SCHEMA_VERSION, amount, period_id, blacklist.clone()),
             );
 
+            env.events().publish(
+                (EVENT_REV_INIA_V1, issuer.clone(), namespace.clone(), token.clone()),
+                (EVENT_SCHEMA_VERSION, payout_asset.clone(), amount, period_id, blacklist.clone()),
+            );
+
+            env.events().publish(
+                (EVENT_REV_REP_V1, issuer.clone(), namespace.clone(), token.clone()),
+                (EVENT_SCHEMA_VERSION, amount, period_id, blacklist.clone()),
+            );
+
+            env.events().publish(
+                (EVENT_REV_REPA_V1, issuer.clone(), namespace.clone(), token.clone()),
+                (EVENT_SCHEMA_VERSION, payout_asset.clone(), amount, period_id),
+            );
+        }
+
         /// Versioned event v2: [version: u32, payout_asset: Address, amount: i128, period_id: u64, blacklist: Vec<Address>]
         Self::emit_v2_event(
             &env,
             (EVENT_REV_INIA_V2, issuer.clone(), namespace.clone(), token.clone()),
-            (payout_asset.clone(), amount, period_id, blacklist.clone())
+            (payout_asset.clone(), amount, period_id, blacklist.clone()),
         );
 
         /// Versioned event v2: [version: u32, amount: i128, period_id: u64, blacklist: Vec<Address>]
         Self::emit_v2_event(
             &env,
             (EVENT_REV_REP_V2, issuer.clone(), namespace.clone(), token.clone()),
-            (amount, period_id, blacklist.clone())
+            (amount, period_id, blacklist.clone()),
         );
 
         /// Versioned event v2: [version: u32, payout_asset: Address, amount: i128, period_id: u64]
         Self::emit_v2_event(
             &env,
             (EVENT_REV_REPA_V2, issuer.clone(), namespace.clone(), token.clone()),
-            (payout_asset.clone(), amount, period_id)
+            (payout_asset.clone(), amount, period_id),
         );
+
+        Ok(())
+    }
+
+    pub fn reconcile_audit_summary(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+    ) -> AuditReconciliationResult {
+        let offering_id = OfferingId { issuer, namespace, token };
+
+        let summary_key = DataKey::AuditSummary(offering_id.clone());
+        let stored: AuditSummary = env
+            .storage()
+            .persistent()
+            .get(&summary_key)
+            .unwrap_or(AuditSummary { total_revenue: 0, report_count: 0 });
+
+        let reports_key = DataKey::RevenueReports(offering_id);
+        let reports: Map<u64, (i128, u64)> =
+            env.storage().persistent().get(&reports_key).unwrap_or_else(|| Map::new(&env));
+
+        let computed_report_count = reports.len() as u64;
+        let mut computed_total: i128 = 0;
+        let mut saturated = false;
+
+        let keys = reports.keys();
+        for i in 0..keys.len() {
+            let period_id = keys.get(i).unwrap();
+            if let Some((amount, _)) = reports.get(period_id) {
+                match computed_total.checked_add(amount) {
+                    Some(total) => computed_total = total,
+                    None => {
+                        computed_total = i128::MAX;
+                        saturated = true;
+                    }
+                }
+            }
+        }
 
         let is_consistent = !saturated
             && stored.total_revenue == computed_total
@@ -1853,6 +1996,8 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
             is_consistent,
             is_saturated: saturated,
         }
+
+        Ok(())
     }
 
     /// Repair the `AuditSummary` for an offering by recomputing it from the
@@ -1913,10 +2058,8 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
             }
         }
 
-        let corrected = AuditSummary {
-            total_revenue: computed_total,
-            report_count: computed_report_count,
-        };
+        let corrected =
+            AuditSummary { total_revenue: computed_total, report_count: computed_report_count };
 
         let summary_key = DataKey::AuditSummary(offering_id);
         env.storage().persistent().set(&summary_key, &corrected);
@@ -2259,9 +2402,9 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
             env.storage().persistent().get(&key).unwrap_or_else(|| Map::new(&env));
 
         if !Self::is_event_only(&env) {
-            let key = DataKey::Whitelist(offering_id.clone());
-            let mut map: Map<Address, bool> =
-                env.storage().persistent().get(&key).unwrap_or_else(|| Map::new(&env));
+            map.set(investor.clone(), true);
+            env.storage().persistent().set(&key, &map);
+        }
 
         env.events().publish(
             (
@@ -2305,7 +2448,8 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
 
         if !Self::is_event_only(&env) {
             let key = DataKey::Whitelist(offering_id.clone());
-            if let Some(mut map) = env.storage().persistent().get::<DataKey, Map<Address, bool>>(&key)
+            if let Some(mut map) =
+                env.storage().persistent().get::<DataKey, Map<Address, bool>>(&key)
             {
                 if map.remove(investor.clone()).is_some() {
                     env.storage().persistent().set(&key, &map);
@@ -2429,7 +2573,8 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
             issuer.require_auth();
             let key = DataKey::ConcentrationLimit(offering_id);
             env.storage().persistent().set(&key, &ConcentrationLimitConfig { max_bps, enforce });
-            env.events().publish((EVENT_CONC_LIMIT_SET, issuer, namespace, token), (max_bps, enforce));
+            env.events()
+                .publish((EVENT_CONC_LIMIT_SET, issuer, namespace, token), (max_bps, enforce));
         }
         Ok(())
     }
@@ -2495,7 +2640,7 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
                 );
             }
         }
-        
+
         if !Self::is_event_only(&env) {
             env.events().publish(
                 (EVENT_CONCENTRATION_REPORTED, issuer, namespace, token),
@@ -2568,7 +2713,7 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
         issuer.require_auth();
         let key = DataKey::RoundingMode(offering_id);
         env.storage().persistent().set(&key, &mode);
-            env.events().publish((EVENT_ROUNDING_MODE_SET, issuer, namespace, token), mode);
+        env.events().publish((EVENT_ROUNDING_MODE_SET, issuer, namespace, token), mode);
         Ok(())
     }
 
@@ -2861,7 +3006,7 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
         Self::emit_v2_event(
             &env,
             (EVENT_REV_DEP_SNAP_V2, issuer.clone(), namespace.clone(), token.clone()),
-            (payment_token, amount, period_id, snapshot_reference)
+            (payment_token, amount, period_id, snapshot_reference),
         );
 
         Ok(())
@@ -3043,9 +3188,7 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
         snapshot_ref: u64,
     ) -> Option<SnapshotEntry> {
         let offering_id = OfferingId { issuer, namespace, token };
-        env.storage()
-            .persistent()
-            .get(&DataKey::SnapshotEntry(offering_id, snapshot_ref))
+        env.storage().persistent().get(&DataKey::SnapshotEntry(offering_id, snapshot_ref))
     }
 
     /// Apply a batch of holder shares for a committed snapshot.
@@ -3097,11 +3240,8 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
 
         // Snapshot must have been committed first.
         let entry_key = DataKey::SnapshotEntry(offering_id.clone(), snapshot_ref);
-        let mut entry: SnapshotEntry = env
-            .storage()
-            .persistent()
-            .get(&entry_key)
-            .ok_or(RevoraError::OutdatedSnapshot)?;
+        let mut entry: SnapshotEntry =
+            env.storage().persistent().get(&entry_key).ok_or(RevoraError::OutdatedSnapshot)?;
 
         let batch_len = holders.len();
         if batch_len > Self::MAX_SNAPSHOT_BATCH {
@@ -3128,10 +3268,9 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
             );
 
             // Update live holder share so claim() works immediately.
-            env.storage().persistent().set(
-                &DataKey::HolderShare(offering_id.clone(), holder),
-                &share_bps,
-            );
+            env.storage()
+                .persistent()
+                .set(&DataKey::HolderShare(offering_id.clone(), holder), &share_bps);
 
             added_bps = added_bps.saturating_add(share_bps);
         }
@@ -3180,9 +3319,7 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
         index: u32,
     ) -> Option<(Address, u32)> {
         let offering_id = OfferingId { issuer, namespace, token };
-        env.storage()
-            .persistent()
-            .get(&DataKey::SnapshotHolder(offering_id, snapshot_ref, index))
+        env.storage().persistent().get(&DataKey::SnapshotHolder(offering_id, snapshot_ref, index))
     }
     ///
     /// The share determines the percentage of a period's revenue the holder can claim.
@@ -3535,6 +3672,13 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
         let delay_secs: u64 = env.storage().persistent().get(&delay_key).unwrap_or(0);
         let now = env.ledger().timestamp();
 
+        // Claim-after-cancel: read the cancellation timestamp once (None = active offering).
+        // Periods deposited after this timestamp are skipped; pre-cancel periods are claimable.
+        let cancelled_at: Option<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OfferingCancelledAt(offering_id.clone()));
+
         let mut total_payout: i128 = 0;
         let mut claimed_periods = Vec::new(&env);
         let mut last_claimed_idx = start_idx;
@@ -3544,6 +3688,17 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
             let period_id: u64 = env.storage().persistent().get(&entry_key).unwrap();
             let time_key = DataKey::PeriodDepositTime(offering_id.clone(), period_id);
             let deposit_time: u64 = env.storage().persistent().get(&time_key).unwrap_or(0);
+
+            // Claim-after-cancel: skip (and advance past) any period deposited after cancellation.
+            // This is a defensive guard; in practice deposit_revenue already blocks post-cancel
+            // deposits, so this branch should never be taken on a well-formed chain.
+            if let Some(ts) = cancelled_at {
+                if deposit_time > ts {
+                    last_claimed_idx = i + 1;
+                    continue;
+                }
+            }
+
             if delay_secs > 0 && now < deposit_time.saturating_add(delay_secs) {
                 break;
             }
@@ -3563,11 +3718,10 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
         if total_payout > 0 {
             let payment_token = Self::get_locked_payment_token_for_offering(&env, &offering_id)?;
             let contract_addr = env.current_contract_address();
-            if token::Client::new(&env, &payment_token).try_transfer(
-                &contract_addr,
-                &holder,
-                &total_payout,
-            ).is_err() {
+            if token::Client::new(&env, &payment_token)
+                .try_transfer(&contract_addr, &holder, &total_payout)
+                .is_err()
+            {
                 return Err(RevoraError::TransferFailed);
             }
         }
@@ -4080,17 +4234,11 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
 
     // ── Admin rotation safety flow (Issue #191) ───────────────
 
-    pub fn propose_admin_rotation(
-        env: Env,
-        new_admin: Address,
-    ) -> Result<(), RevoraError> {
+    pub fn propose_admin_rotation(env: Env, new_admin: Address) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
 
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .ok_or(RevoraError::NotInitialized)?;
+        let admin: Address =
+            env.storage().persistent().get(&DataKey::Admin).ok_or(RevoraError::NotInitialized)?;
 
         admin.require_auth();
 
@@ -4104,18 +4252,12 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
 
         env.storage().persistent().set(&DataKey::PendingAdmin, &new_admin);
 
-        env.events().publish(
-            (symbol_short!("adm_prop"), admin),
-            new_admin,
-        );
+        env.events().publish((symbol_short!("adm_prop"), admin), new_admin);
 
         Ok(())
     }
 
-    pub fn accept_admin_rotation(
-        env: Env,
-        new_admin: Address,
-    ) -> Result<(), RevoraError> {
+    pub fn accept_admin_rotation(env: Env, new_admin: Address) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
 
         let pending: Address = env
@@ -4130,19 +4272,13 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
 
         new_admin.require_auth();
 
-        let old_admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .ok_or(RevoraError::NotInitialized)?;
+        let old_admin: Address =
+            env.storage().persistent().get(&DataKey::Admin).ok_or(RevoraError::NotInitialized)?;
 
         env.storage().persistent().set(&DataKey::Admin, &new_admin);
         env.storage().persistent().remove(&DataKey::PendingAdmin);
 
-        env.events().publish(
-            (symbol_short!("adm_acc"), old_admin),
-            new_admin,
-        );
+        env.events().publish((symbol_short!("adm_acc"), old_admin), new_admin);
 
         Ok(())
     }
@@ -4150,11 +4286,8 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
     pub fn cancel_admin_rotation(env: Env) -> Result<(), RevoraError> {
         Self::require_not_frozen(&env)?;
 
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .ok_or(RevoraError::NotInitialized)?;
+        let admin: Address =
+            env.storage().persistent().get(&DataKey::Admin).ok_or(RevoraError::NotInitialized)?;
 
         admin.require_auth();
 
@@ -4166,10 +4299,7 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
 
         env.storage().persistent().remove(&DataKey::PendingAdmin);
 
-        env.events().publish(
-            (symbol_short!("adm_canc"), admin),
-            pending,
-        );
+        env.events().publish((symbol_short!("adm_canc"), admin), pending);
 
         Ok(())
     }
@@ -4355,6 +4485,25 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
     }
 
     /// Approve an existing multisig proposal.
+    ///
+    /// # Duplicate-approval guard
+    /// Each owner may approve a proposal at most once. If `approver` is already
+    /// present in `proposal.approvals`, the call returns
+    /// [`RevoraError::AlreadyApproved`] rather than silently succeeding.
+    ///
+    /// **Security rationale:** The approval list is the sole input to threshold
+    /// enforcement. Allowing duplicate entries would inflate the apparent approval
+    /// count and could allow a single owner to satisfy an N-of-M threshold alone.
+    /// The guard is a linear scan over the approval list; because the list is
+    /// bounded by the owner count (itself bounded at init time), the scan is O(M)
+    /// where M is the number of owners — safe for all realistic multisig sizes.
+    ///
+    /// # Errors
+    /// - [`RevoraError::LimitReached`] — multisig not initialized, proposal not
+    ///   found, or proposal already executed.
+    /// - [`RevoraError::AlreadyApproved`] — `approver` has already approved this
+    ///   proposal.
+    /// - Auth panic — `approver` is not a registered multisig owner.
     pub fn approve_action(
         env: Env,
         approver: Address,
@@ -4371,10 +4520,12 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
             return Err(RevoraError::LimitReached);
         }
 
-        // Check for duplicate approvals
+        // Duplicate-approval guard: the approval list must be a set.
+        // A linear scan is safe here because the list length is bounded by the
+        // number of registered owners, which is fixed at init time.
         for i in 0..proposal.approvals.len() {
             if proposal.approvals.get(i).unwrap() == approver {
-                return Ok(()); // Already approved
+                return Err(RevoraError::AlreadyApproved);
             }
         }
 
@@ -4568,6 +4719,11 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
         }
 
         let new_issuer = pending.new_issuer;
+
+        // Typed check: caller must be the nominated new issuer.
+        if caller != new_issuer {
+            return Err(RevoraError::UnauthorizedTransferAccept);
+        }
 
         // Only the proposed new issuer can accept
         new_issuer.require_auth();
@@ -4859,10 +5015,11 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
             return 0i128;
         }
 
-        let offering = match Self::get_offering(env.clone(), issuer.clone(), namespace, token.clone()) {
-            Some(o) => o,
-            None => return 0i128,
-        };
+        let offering =
+            match Self::get_offering(env.clone(), issuer.clone(), namespace, token.clone()) {
+                Some(o) => o,
+                None => return 0i128,
+            };
 
         if Self::is_blacklisted(
             env.clone(),
@@ -5046,6 +5203,124 @@ fn require_next_period_id(env: &Env, offering_id: &OfferingId, period_id: u64) -
         let offering_id = OfferingId { issuer, namespace, token };
         let key = DataKey::OfferingMetadata(offering_id);
         env.storage().persistent().get(&key)
+    }
+
+    /// Configure clippy/format gate policy for an offering.
+    /// Security assumption: the caller is trusted to set policy controls for this offering.
+    pub fn set_clippy_format_gate(
+        env: Env,
+        caller: Address,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        enforce: bool,
+        max_attestation_age_secs: u64,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        Self::require_not_paused(&env);
+
+        if max_attestation_age_secs == 0
+            || max_attestation_age_secs > Self::MAX_GATE_ATTESTATION_AGE_SECS
+        {
+            return Err(RevoraError::GatePolicyInvalid);
+        }
+
+        let current_issuer =
+            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+
+        caller.require_auth();
+        if caller != current_issuer {
+            let admin = Self::get_admin(env.clone()).ok_or(RevoraError::NotInitialized)?;
+            if caller != admin {
+                return Err(RevoraError::NotAuthorized);
+            }
+        }
+
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+
+        let config = ClippyFormatGateConfig { enforce, max_attestation_age_secs };
+
+        env.storage().persistent().set(&DataKey::ClippyFormatGateConfig(offering_id), &config);
+        env.events().publish(
+            (EVENT_GATE_CONFIG_SET, issuer, namespace, token),
+            (caller, enforce, max_attestation_age_secs),
+        );
+        Ok(())
+    }
+
+    /// Read clippy/format gate policy for an offering.
+    pub fn get_clippy_format_gate(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+    ) -> Option<ClippyFormatGateConfig> {
+        let offering_id = OfferingId { issuer, namespace, token };
+        env.storage().persistent().get(&DataKey::ClippyFormatGateConfig(offering_id))
+    }
+
+    /// Record clippy/format attestation for an offering.
+    /// Security assumption: attester is issuer or admin and upstream CI artifact hash is trustworthy.
+    pub fn attest_clippy_format_gate(
+        env: Env,
+        caller: Address,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        attestation_input: ClippyFormatGateAttestationInput,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        Self::require_not_paused(&env);
+
+        let current_issuer =
+            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+
+        caller.require_auth();
+        if caller != current_issuer {
+            let admin = Self::get_admin(env.clone()).ok_or(RevoraError::NotInitialized)?;
+            if caller != admin {
+                return Err(RevoraError::NotAuthorized);
+            }
+        }
+
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+
+        let attestation = ClippyFormatGateAttestation {
+            attested_at: env.ledger().timestamp(),
+            format_ok: attestation_input.format_ok,
+            clippy_ok: attestation_input.clippy_ok,
+            artifact_hash: attestation_input.artifact_hash,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ClippyFormatGateAttestation(offering_id), &attestation);
+        env.events().publish(
+            (EVENT_GATE_ATTESTED, issuer, namespace, token),
+            (caller, attestation_input.format_ok, attestation_input.clippy_ok),
+        );
+        Ok(())
+    }
+
+    /// Read clippy/format gate attestation for an offering.
+    pub fn get_clippy_format_attestation(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+    ) -> Option<ClippyFormatGateAttestation> {
+        let offering_id = OfferingId { issuer, namespace, token };
+        env.storage().persistent().get(&DataKey::ClippyFormatGateAttestation(offering_id))
     }
 
     // ── Testnet mode configuration (#24) ───────────────────────
@@ -5399,3 +5674,5 @@ mod test_cross_contract;
 #[cfg(test)]
 mod test_namespaces;
 mod test_period_id_boundary;
+#[cfg(test)]
+mod structured_error_tests;
