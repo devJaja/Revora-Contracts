@@ -4672,7 +4672,7 @@ fn issuer_transfer_accept_completes_transfer() {
     let new_issuer = Address::generate(&env);
 
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &new_issuer);
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
 
     // Verify no pending transfer after acceptance
     assert_eq!(client.get_pending_issuer_transfer(&issuer, &symbol_short!("def"), &token), None);
@@ -4690,7 +4690,7 @@ fn issuer_transfer_accept_emits_event() {
 
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &new_issuer);
     let before = legacy_events(&env).len();
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
     assert!(legacy_events(&env).len() > before);
 }
 
@@ -4704,7 +4704,7 @@ fn issuer_transfer_new_issuer_can_deposit_revenue() {
     mint_tokens(&env, &payment_token, &pt_admin, &new_issuer, &5_000_000);
 
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &new_issuer);
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
 
     // New issuer should be able to deposit revenue
     let result = client.try_deposit_revenue(
@@ -4833,7 +4833,7 @@ fn issuer_transfer_new_issuer_can_set_holder_share() {
     let holder = Address::generate(&env);
 
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &new_issuer);
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
 
     // New issuer should be able to set holder shares
     let result =
@@ -4848,7 +4848,7 @@ fn issuer_transfer_old_issuer_loses_access() {
     let new_issuer = Address::generate(&env);
 
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &new_issuer);
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
 
     // Old issuer should not be able to deposit revenue
     let result = client.try_deposit_revenue(
@@ -4869,7 +4869,7 @@ fn issuer_transfer_old_issuer_cannot_set_holder_share() {
     let holder = Address::generate(&env);
 
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &new_issuer);
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
 
     // Old issuer should not be able to set holder shares
     let result =
@@ -5085,9 +5085,10 @@ fn issuer_transfer_cannot_propose_when_already_pending() {
 
 #[test]
 fn issuer_transfer_cannot_accept_when_no_pending() {
-    let (_env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
+    let any_caller = Address::generate(&env);
 
-    let result = client.try_accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    let result = client.try_accept_issuer_transfer(&any_caller, &issuer, &symbol_short!("def"), &token);
     assert!(result.is_err());
 }
 
@@ -5122,9 +5123,10 @@ fn issuer_transfer_accept_requires_auth() {
     let token = Address::generate(&env);
 
     let _issuer = Address::generate(&env);
+    let _new_issuer = Address::generate(&env);
 
     // No mock_all_auths - should panic
-    client.accept_issuer_transfer(&_issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&_new_issuer, &_issuer, &symbol_short!("def"), &token);
 }
 
 #[test]
@@ -5146,10 +5148,10 @@ fn issuer_transfer_double_accept_fails() {
     let new_issuer = Address::generate(&env);
 
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &new_issuer);
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
 
     // Second accept should fail (no pending transfer)
-    let result = client.try_accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    let result = client.try_accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
     assert!(result.is_err());
 }
 
@@ -5164,7 +5166,7 @@ fn issuer_transfer_to_same_address() {
         client.try_propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &issuer);
     assert!(result.is_ok());
 
-    let result = client.try_accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    let result = client.try_accept_issuer_transfer(&issuer, &issuer, &symbol_short!("def"), &token);
     assert!(result.is_ok());
 }
 
@@ -5183,7 +5185,7 @@ fn issuer_transfer_multiple_offerings_isolation() {
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token_b, &new_issuer_b);
 
     // Accept only token_a transfer
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token_a);
+    client.accept_issuer_transfer(&new_issuer_a, &issuer, &symbol_short!("def"), &token_a);
 
     // Verify token_a transferred but token_b still pending
     assert_eq!(client.get_pending_issuer_transfer(&issuer, &symbol_short!("def"), &token_a), None);
@@ -5368,12 +5370,13 @@ fn multisig_duplicate_approval_is_idempotent() {
     let (_env, client, owner1, _owner2, _owner3, _caller) = multisig_setup();
 
     let proposal_id = client.propose_action(&owner1, &ProposalAction::Freeze);
-    // owner1 already approved (auto-approval from propose)
-    // Approving again should be a no-op (not an error, not a duplicate entry)
-    client.approve_action(&owner1, &proposal_id);
+    // owner1 already approved (auto-approval from propose).
+    // A second approval by the same owner must be rejected with AlreadyApproved.
+    let r = client.try_approve_action(&owner1, &proposal_id);
+    assert_eq!(r, Err(Ok(RevoraError::AlreadyApproved)));
 
+    // Approval list must remain a set — still exactly 1 entry.
     let proposal = client.get_proposal(&proposal_id).unwrap();
-    // Still only 1 approval (no duplicate)
     assert_eq!(proposal.approvals.len(), 1);
 }
 
@@ -5605,6 +5608,136 @@ fn multisig_get_proposal_nonexistent_returns_none() {
     assert!(client.get_proposal(&9999).is_none());
 }
 
+// ── Duplicate-approval guard tests ────────────────────────────────────────────
+//
+// Security assumption: the approval list is a set — each owner address appears
+// at most once. Threshold enforcement counts list length, so any inflation of
+// that count would allow a single owner to satisfy an N-of-M threshold alone.
+// These tests validate every path through the guard.
+
+/// Proposer's auto-approval is counted; a second call by the proposer returns
+/// AlreadyApproved and does NOT add a second entry.
+#[test]
+fn multisig_duplicate_approval_proposer_returns_already_approved() {
+    let (_env, client, owner1, _owner2, _owner3, _caller) = multisig_setup();
+
+    let pid = client.propose_action(&owner1, &ProposalAction::Freeze);
+    let r = client.try_approve_action(&owner1, &pid);
+    assert_eq!(r, Err(Ok(RevoraError::AlreadyApproved)));
+
+    let proposal = client.get_proposal(&pid).unwrap();
+    assert_eq!(proposal.approvals.len(), 1);
+}
+
+/// A non-proposer owner who approves once cannot approve a second time.
+#[test]
+fn multisig_duplicate_approval_second_owner_returns_already_approved() {
+    let (_env, client, owner1, owner2, _owner3, _caller) = multisig_setup();
+
+    let pid = client.propose_action(&owner1, &ProposalAction::Freeze);
+    client.approve_action(&owner2, &pid); // first approval by owner2 — ok
+    let r = client.try_approve_action(&owner2, &pid); // second — must fail
+    assert_eq!(r, Err(Ok(RevoraError::AlreadyApproved)));
+
+    let proposal = client.get_proposal(&pid).unwrap();
+    // owner1 (auto) + owner2 = 2, no duplicates
+    assert_eq!(proposal.approvals.len(), 2);
+}
+
+/// All three owners approve once each; no duplicates; count reaches 3.
+#[test]
+fn multisig_duplicate_approval_all_owners_approve_once_each() {
+    let (_env, client, owner1, owner2, owner3, _caller) = multisig_setup();
+
+    let pid = client.propose_action(&owner1, &ProposalAction::Freeze);
+    client.approve_action(&owner2, &pid);
+    client.approve_action(&owner3, &pid);
+
+    let proposal = client.get_proposal(&pid).unwrap();
+    assert_eq!(proposal.approvals.len(), 3);
+    // Each owner appears exactly once
+    assert_eq!(proposal.approvals.get(0).unwrap(), owner1);
+    assert_eq!(proposal.approvals.get(1).unwrap(), owner2);
+    assert_eq!(proposal.approvals.get(2).unwrap(), owner3);
+}
+
+/// Duplicate approval does NOT emit a prop_app event (no side-effects on failure).
+#[test]
+fn multisig_duplicate_approval_emits_no_event_on_rejection() {
+    let (env, client, owner1, _owner2, _owner3, _caller) = multisig_setup();
+
+    let pid = client.propose_action(&owner1, &ProposalAction::Freeze);
+    let before = env.events().all().len();
+    let _ = client.try_approve_action(&owner1, &pid); // duplicate — must fail
+                                                      // No new events should have been emitted
+    assert_eq!(env.events().all().len(), before);
+}
+
+/// Duplicate approval on an already-executed proposal returns LimitReached
+/// (executed check fires before the duplicate guard).
+#[test]
+fn multisig_duplicate_approval_on_executed_proposal_returns_limit_reached() {
+    let (_env, client, owner1, owner2, _owner3, _caller) = multisig_setup();
+
+    let pid = client.propose_action(&owner1, &ProposalAction::Freeze);
+    client.approve_action(&owner2, &pid);
+    client.execute_action(&pid);
+
+    // owner1 tries to approve again after execution
+    let r = client.try_approve_action(&owner1, &pid);
+    assert_eq!(r, Err(Ok(RevoraError::LimitReached)));
+}
+
+/// A duplicate approval attempt does not advance the approval count and therefore
+/// cannot push a proposal from below-threshold to at-threshold.
+#[test]
+fn multisig_duplicate_approval_cannot_satisfy_threshold() {
+    let (_env, client, owner1, _owner2, _owner3, _caller) = multisig_setup();
+
+    // threshold = 2; only owner1 has approved (auto)
+    let pid = client.propose_action(&owner1, &ProposalAction::Freeze);
+
+    // owner1 tries to double-approve to reach threshold=2 alone
+    let _ = client.try_approve_action(&owner1, &pid);
+
+    // Execution must still fail — threshold not met
+    let r = client.try_execute_action(&pid);
+    assert!(r.is_err());
+    assert!(!client.is_frozen());
+}
+
+/// Duplicate approval on a non-existent proposal returns OfferingNotFound
+/// (proposal lookup fires before the duplicate guard).
+#[test]
+fn multisig_duplicate_approval_nonexistent_proposal_returns_not_found() {
+    let (_env, client, owner1, _owner2, _owner3, _caller) = multisig_setup();
+
+    let r = client.try_approve_action(&owner1, &9999);
+    assert_eq!(r, Err(Ok(RevoraError::OfferingNotFound)));
+}
+
+/// Duplicate approvals across independent proposals do not cross-contaminate.
+#[test]
+fn multisig_duplicate_approval_independent_proposals_isolated() {
+    let (_env, client, owner1, owner2, _owner3, _caller) = multisig_setup();
+
+    let p1 = client.propose_action(&owner1, &ProposalAction::Freeze);
+    let p2 = client.propose_action(&owner1, &ProposalAction::Freeze);
+
+    // owner2 approves p1 — valid
+    client.approve_action(&owner2, &p1);
+    // owner2 approves p2 — also valid (different proposal)
+    client.approve_action(&owner2, &p2);
+
+    // owner2 tries to approve p1 again — must fail
+    let r = client.try_approve_action(&owner2, &p1);
+    assert_eq!(r, Err(Ok(RevoraError::AlreadyApproved)));
+
+    // p2 approval count unaffected
+    let proposal2 = client.get_proposal(&p2).unwrap();
+    assert_eq!(proposal2.approvals.len(), 2);
+}
+
 #[test]
 fn issuer_transfer_accept_blocked_when_frozen() {
     let (env, client, issuer, token, _payment_token, _contract_id) = claim_setup();
@@ -5616,7 +5749,7 @@ fn issuer_transfer_accept_blocked_when_frozen() {
     client.set_admin(&admin);
     client.freeze();
 
-    let result = client.try_accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    let result = client.try_accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
     assert!(result.is_err());
 }
 
@@ -5656,7 +5789,7 @@ fn issuer_transfer_preserves_audit_summary() {
 
     // Transfer issuer
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &new_issuer);
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
 
     // Audit summary should still be accessible
     let summary_after = client.get_audit_summary(&issuer, &symbol_short!("def"), &token).unwrap();
@@ -5670,7 +5803,7 @@ fn issuer_transfer_new_issuer_can_report_revenue() {
     let new_issuer = Address::generate(&env);
 
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &new_issuer);
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
 
     // New issuer can report revenue
     let result = client.try_report_revenue(
@@ -5691,7 +5824,7 @@ fn issuer_transfer_new_issuer_can_set_concentration_limit() {
     let new_issuer = Address::generate(&env);
 
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &new_issuer);
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
 
     // New issuer can set concentration limit
     let result = client.try_set_concentration_limit(
@@ -5710,7 +5843,7 @@ fn issuer_transfer_new_issuer_can_set_rounding_mode() {
     let new_issuer = Address::generate(&env);
 
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &new_issuer);
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
 
     // New issuer can set rounding mode
     let result = client.try_set_rounding_mode(
@@ -5728,7 +5861,7 @@ fn issuer_transfer_new_issuer_can_set_claim_delay() {
     let new_issuer = Address::generate(&env);
 
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &new_issuer);
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
 
     // New issuer can set claim delay
     let result = client.try_set_claim_delay(&new_issuer, &symbol_short!("def"), &token, &3600);
@@ -5747,7 +5880,7 @@ fn issuer_transfer_holders_can_still_claim() {
 
     // Transfer issuer
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &new_issuer);
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
 
     // Holder should still be able to claim
     let payout = client.claim(&holder, &issuer, &symbol_short!("def"), &token, &0);
@@ -5765,7 +5898,7 @@ fn issuer_transfer_then_new_deposits_and_claims_work() {
 
     // Transfer issuer
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &new_issuer);
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
 
     // New issuer sets share and deposits
     client.set_holder_share(&new_issuer, &symbol_short!("def"), &token, &holder, &5_000);
@@ -5789,7 +5922,7 @@ fn issuer_transfer_get_offering_still_works() {
     let new_issuer = Address::generate(&env);
 
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &new_issuer);
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
 
     // get_offering should find the offering under new issuer now
     let offering = client.get_offering(&new_issuer, &symbol_short!("def"), &token);
@@ -5805,7 +5938,7 @@ fn issuer_transfer_preserves_revenue_share_bps() {
     let offering_before = client.get_offering(&issuer, &symbol_short!("def"), &token);
 
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &new_issuer);
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
 
     let offering_after = client.get_offering(&new_issuer, &symbol_short!("def"), &token);
     assert_eq!(
@@ -5820,7 +5953,7 @@ fn issuer_transfer_old_issuer_cannot_report_concentration() {
     let new_issuer = Address::generate(&env);
 
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &new_issuer);
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
 
     // Old issuer should not be able to report concentration
     let result = client.try_report_concentration(&issuer, &symbol_short!("def"), &token, &5_000);
@@ -5835,7 +5968,7 @@ fn issuer_transfer_new_issuer_can_report_concentration() {
     client.set_concentration_limit(&issuer, &symbol_short!("def"), &token, &6_000, &false);
 
     client.propose_issuer_transfer(&issuer, &symbol_short!("def"), &token, &new_issuer);
-    client.accept_issuer_transfer(&issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &issuer, &symbol_short!("def"), &token);
 
     // New issuer can report concentration
     let result =
@@ -7418,7 +7551,7 @@ fn test_metadata_after_issuer_transfer() {
 
     // Propose and accept transfer
     client.propose_issuer_transfer(&old_issuer, &symbol_short!("def"), &token, &new_issuer);
-    client.accept_issuer_transfer(&old_issuer, &symbol_short!("def"), &token);
+    client.accept_issuer_transfer(&new_issuer, &old_issuer, &symbol_short!("def"), &token);
 
     // Metadata should still be accessible under old issuer key
     let retrieved = client.get_offering_metadata(&old_issuer, &symbol_short!("def"), &token);
@@ -9984,3 +10117,4 @@ mod negative_amount_validation_matrix {
         assert!(result.is_err(), "Negative amount should be rejected");
     }
 }
+} // mod regression

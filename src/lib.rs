@@ -864,6 +864,14 @@ impl RevoraRevenueShare {
         Ok(())
     }
 
+    /// Returns the admin address or `Err(NotInitialized)` when `DataKey::Admin` is absent.
+    fn require_admin(env: &Env) -> Result<Address, RevoraError> {
+        env.storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .ok_or(RevoraError::NotInitialized)
+    }
+
     /// Helper to emit deterministic v2 versioned events for core event versioning.
     /// Emits: topic -> (EVENT_SCHEMA_VERSION_V2, data...)
     /// All core events MUST use this for schema compliance and indexer compatibility.
@@ -1883,6 +1891,8 @@ impl RevoraRevenueShare {
             is_consistent,
             is_saturated: saturated,
         }
+
+        Ok(())
     }
 
     /// Repair the `AuditSummary` for an offering by recomputing it from the
@@ -4370,6 +4380,25 @@ impl RevoraRevenueShare {
     }
 
     /// Approve an existing multisig proposal.
+    ///
+    /// # Duplicate-approval guard
+    /// Each owner may approve a proposal at most once. If `approver` is already
+    /// present in `proposal.approvals`, the call returns
+    /// [`RevoraError::AlreadyApproved`] rather than silently succeeding.
+    ///
+    /// **Security rationale:** The approval list is the sole input to threshold
+    /// enforcement. Allowing duplicate entries would inflate the apparent approval
+    /// count and could allow a single owner to satisfy an N-of-M threshold alone.
+    /// The guard is a linear scan over the approval list; because the list is
+    /// bounded by the owner count (itself bounded at init time), the scan is O(M)
+    /// where M is the number of owners — safe for all realistic multisig sizes.
+    ///
+    /// # Errors
+    /// - [`RevoraError::LimitReached`] — multisig not initialized, proposal not
+    ///   found, or proposal already executed.
+    /// - [`RevoraError::AlreadyApproved`] — `approver` has already approved this
+    ///   proposal.
+    /// - Auth panic — `approver` is not a registered multisig owner.
     pub fn approve_action(
         env: Env,
         approver: Address,
@@ -4386,10 +4415,12 @@ impl RevoraRevenueShare {
             return Err(RevoraError::LimitReached);
         }
 
-        // Check for duplicate approvals
+        // Duplicate-approval guard: the approval list must be a set.
+        // A linear scan is safe here because the list length is bounded by the
+        // number of registered owners, which is fixed at init time.
         for i in 0..proposal.approvals.len() {
             if proposal.approvals.get(i).unwrap() == approver {
-                return Ok(()); // Already approved
+                return Err(RevoraError::AlreadyApproved);
             }
         }
 
@@ -4552,6 +4583,7 @@ impl RevoraRevenueShare {
     /// Accept a pending issuer transfer. Only the proposed new issuer may call this.
     pub fn accept_issuer_transfer(
         env: Env,
+        caller: Address,
         issuer: Address,
         namespace: Symbol,
         token: Address,
@@ -4576,6 +4608,11 @@ impl RevoraRevenueShare {
         }
 
         let new_issuer = pending.new_issuer;
+
+        // Typed check: caller must be the nominated new issuer.
+        if caller != new_issuer {
+            return Err(RevoraError::UnauthorizedTransferAccept);
+        }
 
         // Only the proposed new issuer can accept
         new_issuer.require_auth();
@@ -5181,9 +5218,7 @@ impl RevoraRevenueShare {
     /// When enabled, certain validations are relaxed for testnet deployments.
     /// Emits event with new mode state.
     pub fn set_testnet_mode(env: Env, enabled: bool) -> Result<(), RevoraError> {
-        let key = DataKey::Admin;
-        let admin: Address =
-            env.storage().persistent().get(&key).ok_or(RevoraError::LimitReached)?;
+        let admin = Self::require_admin(&env)?;
         admin.require_auth();
         if !Self::is_event_only(&env) {
             let mode_key = DataKey::TestnetMode;
@@ -5525,3 +5560,5 @@ mod test_cross_contract;
 #[cfg(test)]
 mod test_namespaces;
 mod test_period_id_boundary;
+#[cfg(test)]
+mod structured_error_tests;
